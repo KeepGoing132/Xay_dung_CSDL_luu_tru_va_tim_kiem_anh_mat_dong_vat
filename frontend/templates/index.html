@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="FaunaFind — hệ thống truy hồi ảnh khuôn mặt động vật theo nội dung thị giác.">
+  <title>FaunaFind · Visual Search Lab</title>
+  {% set asset_versions = asset_versions | default({'app.css': 'motion-1', 'motion.css': 'motion-1', 'motion.js': 'motion-1', 'app.js': 'motion-1'}) %}
+  <link rel="preload" href="{{ url_for('static', path='/fonts/BeVietnamPro-Regular.ttf') }}" as="font" type="font/ttf" crossorigin>
+  <link rel="preload" href="{{ url_for('static', path='/fonts/BeVietnamPro-SemiBold.ttf') }}" as="font" type="font/ttf" crossorigin>
+  <meta name="theme-color" content="#0a0a0c">
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v={{ asset_versions['app.css'] }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='/motion.css') }}?v={{ asset_versions['motion.css'] }}">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Bỏ qua điều hướng</a>
+  <div class="motion-world" aria-hidden="true">
+    <div class="aurora aurora-blue"></div><div class="aurora aurora-violet"></div><div class="aurora aurora-orange"></div>
+    <div class="motion-grid"></div>
+    <canvas id="ambient-canvas"></canvas>
+    <div class="cursor-halo" id="cursor-halo"></div>
+  </div>
+  <div class="motion-bursts" id="motion-bursts" aria-hidden="true"></div>
+  <svg class="svg-sprite" aria-hidden="true">
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></symbol>
+    <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></symbol>
+    <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></symbol>
+    <symbol id="i-flask" viewBox="0 0 24 24"><path d="M9 3h6M10 3v6l-5.2 8.7A2.2 2.2 0 0 0 6.7 21h10.6a2.2 2.2 0 0 0 1.9-3.3L14 9V3M7.5 14h9"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4m0 0L7 9m5-5 5 5M5 20h14"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 20"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3ZM19 15l.7 2.3L22 18l-2.3.7L19 21l-.7-2.3L16 18l2.3-.7L19 15Z"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 6v12M15 6v12"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="m10.3 4-8 14a2 2 0 0 0 1.7 3h16a2 2 0 0 0 1.7-3l-8-14a2 2 0 0 0-3.4 0ZM12 9v4M12 17h.01"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+  </svg>
+
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Điều hướng chính">
+      <a class="brand" href="#search" data-view-link="search" aria-label="FaunaFind — trang tìm kiếm">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 48 48"><path d="M14 22c-3-1-5-4-4-7s4-4 7-2c2 2 2 6 0 8M34 22c3-1 5-4 4-7s-4-4-7-2c-2 2-2 6 0 8M24 19c-3 0-5-3-5-6s2-6 5-6 5 3 5 6-2 6-5 6Zm0 4c7 0 12 6 12 12 0 5-4 7-8 5-2-1-6-1-8 0-4 2-8 0-8-5 0-6 5-12 12-12Z"/></svg>
+        </span>
+        <span><strong>FaunaFind</strong><small>Visual Search Lab</small></span>
+      </a>
+
+      <nav class="nav-list">
+        <button class="nav-item is-active" type="button" data-view="search" aria-current="page">
+          <svg><use href="#i-search"/></svg><span>Tìm kiếm</span>
+        </button>
+        <button class="nav-item" type="button" data-view="dataset">
+          <svg><use href="#i-database"/></svg><span>Dữ liệu</span><span class="nav-count">{{ stats.approved_gallery }}</span>
+        </button>
+        <button class="nav-item" type="button" data-view="processing">
+          <svg><use href="#i-image"/></svg><span>Xử lý ảnh</span>
+        </button>
+        <button class="nav-item" type="button" data-view="history">
+          <svg><use href="#i-history"/></svg><span>Lịch sử</span>
+        </button>
+        <button class="nav-item" type="button" data-view="method">
+          <svg><use href="#i-flask"/></svg><span>Phương pháp</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-status">
+        <span class="status-dot"></span>
+        <div><strong>Hệ thống sẵn sàng</strong><small>{{ stats.approved_gallery }} ảnh trong gallery</small></div>
+      </div>
+      <p class="sidebar-note">Tính trên ảnh {{ image_size }}×{{ image_size }}<br>{{ feature_info | map(attribute='label') | join(' · ') }}</p>
+    </aside>
+
+    <main class="main-content" id="main-content">
+      <header class="topbar">
+        <button class="mobile-menu" type="button" aria-label="Mở menu" aria-expanded="false">
+          <span></span><span></span><span></span>
+        </button>
+        <div class="breadcrumb"><span>FaunaFind</span><svg><use href="#i-chevron"/></svg><strong id="page-name">Tìm kiếm ảnh</strong></div>
+        <div class="topbar-meta">
+        <button class="motion-toggle" id="motion-toggle" type="button" aria-pressed="true" aria-label="Tắt animation" title="Tắt animation">
+          <svg aria-hidden="true"><use href="#i-spark"/></svg><span>Animation</span><i aria-hidden="true"></i>
+        </button>
+        <label for="profile-select">Bộ tìm kiếm</label><select id="profile-select">
+          <option value="refined512-v1" {% if bundle_name == 'refined512-v1' %}selected{% endif %}>6 đặc trưng cải tiến · 512×512</option>
+          <option value="expanded512-v1" {% if bundle_name == 'expanded512-v1' %}selected{% endif %}>6 đặc trưng · 512×512</option>
+          <option value="native512-v1" {% if bundle_name == 'native512-v1' %}selected{% endif %}>Ảnh gốc · 512×512</option>
+          <option value="background512-white-v1" {% if bundle_name == 'background512-white-v1' %}selected{% endif %}>Ảnh tách nền · 512×512</option>
+          {% if image_size != 512 %}<option value="{{ bundle_name }}" selected>{{ bundle_name }} · {{ image_size }}×{{ image_size }}</option>{% endif %}
+        </select></div>
+      </header>
+
+      <section class="view is-active" id="view-search" aria-labelledby="search-title">
+        <div class="page-intro">
+          <div>
+            <p class="eyebrow"><span></span>Explainable visual retrieval</p>
+            <h1 id="search-title">Tìm khuôn mặt tương đồng,<br><em>hiểu rõ vì sao.</em></h1>
+            <p class="intro-copy">Tải một ảnh bất kỳ. FaunaFind so sánh màu sắc, hình dáng và kết cấu với toàn bộ gallery — không lọc trước theo nhãn loài.</p>
+          </div>
+          <div class="intro-stat" aria-label="Trạng thái bộ dữ liệu">
+            <div class="feature-reactor" aria-hidden="true">
+              <div class="reactor-ring ring-one"></div><div class="reactor-ring ring-two"></div><div class="reactor-ring ring-three"></div>
+              <div class="reactor-core"><svg><use href="#i-spark"/></svg></div>
+              <span class="reactor-label reactor-hsv">HSV</span><span class="reactor-label reactor-hog">HOG</span><span class="reactor-label reactor-lbp">LBP</span>
+            </div>
+            <span class="intro-stat-value">{{ stats.approved_gallery }}</span>
+            <span>ứng viên đã duyệt</span>
+            <small>{{ stats.by_species | length }} nhóm động vật · quét toàn bộ gallery</small>
+          </div>
+        </div>
+
+        <div class="search-workspace">
+          <form class="query-panel panel" id="search-form">
+            <div class="panel-heading">
+              <div><span class="step-number">01</span><div><h2>Ảnh truy vấn</h2><p>JPG, PNG hoặc WebP · tối đa 20 MB</p></div></div>
+              <button class="icon-button is-hidden" id="clear-image" type="button" aria-label="Xóa ảnh đã chọn"><svg><use href="#i-close"/></svg></button>
+            </div>
+
+            <label class="upload-zone" id="upload-zone" for="image-input">
+              <input id="image-input" name="image" type="file" accept="image/jpeg,image/png,image/webp" required>
+              <span class="upload-icon"><svg><use href="#i-upload"/></svg></span>
+              <strong>Thả ảnh vào đây</strong>
+              <span>hoặc <u>chọn từ máy tính</u></span>
+              <small>{% if automatic_background %}Ảnh thường sẽ được tự tách nền; có thể dùng PNG đã tách nền{% elif background_input %}Chọn PNG đã tách nền, có nền trong suốt{% else %}Ảnh chính diện, rõ nét sẽ cho kết quả tốt hơn{% endif %}</small>
+            </label>
+
+            <div class="image-preview is-hidden" id="image-preview-wrap">
+              <img id="image-preview" alt="Ảnh truy vấn đã chọn">
+              <div class="crop-frame is-hidden" id="crop-frame" aria-hidden="true"></div>
+              <span class="image-meta" id="image-meta"></span>
+            </div>
+
+            <details class="control-section" id="crop-details">
+              <summary><span>Vùng khuôn mặt</span><small>Tùy chọn</small></summary>
+              <div class="details-body">
+                <label class="toggle-row"><span><strong>Dùng vùng cắt vuông</strong><small>Chỉ phân tích khu vực được chọn</small></span><input id="use-crop" type="checkbox"><i></i></label>
+                <div class="crop-controls is-disabled" id="crop-controls">
+                  <label>X <output id="crop-x-output">0</output><input id="crop-x" type="range" min="0" value="0"></label>
+                  <label>Y <output id="crop-y-output">0</output><input id="crop-y" type="range" min="0" value="0"></label>
+                  <label>Kích thước <output id="crop-size-output">—</output><input id="crop-size" type="range" min="1" value="1"></label>
+                </div>
+              </div>
+            </details>
+
+            <div class="control-section weights-section">
+              <div class="section-title"><span>Trọng số đặc trưng</span><small id="weight-total">Tổng 100%</small></div>
+              <label class="weight-preset-label" for="weight-preset">So sánh nhanh</label>
+              <select id="weight-preset">{% for preset in weight_presets %}<option value="{{ loop.index0 }}">{{ preset.label }}</option>{% endfor %}<option value="custom" disabled>Tùy chỉnh</option></select>
+              {% if preset_warning %}<p class="form-hint">{{ preset_warning }}</p>{% endif %}
+              {% for feature in feature_info %}
+              <label class="weight-control color-{{ feature.key }}"><span><i></i>{{ feature.label }} <small>{{ feature.description }}</small><output id="{{ feature.key }}-output">{{ (feature.weight * 100) | round | int }}%</output></span><input id="{{ feature.key }}-weight" name="{{ feature.key }}" type="range" min="0" max="1" step="any" value="{{ feature.weight }}"></label>
+              {% endfor %}
+              <p class="form-hint"><svg><use href="#i-info"/></svg>Trọng số được chuẩn hóa tự động trước khi xếp hạng.</p>
+            </div>
+
+            <button class="search-button" id="search-button" type="submit" disabled>
+              <span class="button-label"><svg><use href="#i-spark"/></svg>Tìm 5 ảnh gần nhất</span>
+              <span class="button-loading"><i></i>Đang phân tích ảnh…</span>
+            </button>
+          </form>
+
+          <section class="results-panel panel" aria-live="polite" aria-busy="false">
+            <div class="search-scanner" aria-hidden="true"><span></span><svg><use href="#i-search"/></svg><strong>Đang phân tích ảnh</strong><small>{{ feature_info | length }} nhóm đặc trưng</small><div><i></i><i></i><i></i></div></div>
+            <div class="empty-results" id="empty-results">
+              <div class="orbit-visual" aria-hidden="true"><span></span><span></span><span></span><svg><use href="#i-image"/></svg></div>
+              <p class="eyebrow"><span></span>Ready to explore</p>
+              <h2>Kết quả tương đồng<br>sẽ xuất hiện tại đây</h2>
+              <p>Chọn một ảnh để phân tích {{ total_dimensions }} chiều đặc trưng trên ảnh {{ image_size }}×{{ image_size }}.</p>
+              <div class="pipeline"><span>Ảnh</span><i></i><span>Đặc trưng</span><i></i><span>Top 5</span></div>
+            </div>
+
+            <div class="results-content is-hidden" id="results-content">
+              <div class="results-heading">
+                <div><p class="eyebrow"><span></span>Retrieval complete</p><h2>5 kết quả gần nhất</h2><p id="result-summary"></p></div>
+                <button id="export-results" class="secondary-button" type="button">Xuất kết quả JSON</button><div class="query-id"><small>QUERY ID</small><strong id="query-id">#—</strong></div>
+              </div>
+              <div class="result-grid" id="result-grid"></div>
+              <div class="metric-row" id="metric-row"></div>
+
+              <section class="analysis-card">
+                <div class="card-title"><div><span class="step-number">02</span><div><h3>Giải thích điểm số</h3><p>Đóng góp sau khi áp dụng trọng số</p></div></div><span class="legend">{% for feature in feature_info %}<span><i class="{{ feature.key }}"></i>{{ feature.label }}</span>{% endfor %}</span></div>
+                <div class="contribution-chart" id="contribution-chart"></div>
+                <div class="score-table-wrap"><table class="score-table"><thead><tr><th>Hạng</th><th>Ảnh</th><th>Nhãn</th>{% for feature in feature_info %}<th>{{ feature.label }}</th>{% endfor %}<th>Tổng</th><th>Mạnh nhất</th></tr></thead><tbody id="score-table-body"></tbody></table></div>
+              </section>
+
+              <details class="feature-details" open>
+                <summary><span><span class="step-number">03</span><span><strong>Đặc trưng truy vấn</strong><small>Ảnh sau tiền xử lý và biểu diễn trung gian</small></span></span><svg><use href="#i-chevron"/></svg></summary>
+                <div class="feature-grid">
+                  <figure><img id="feature-rgb" alt="Ảnh RGB {{ image_size }} nhân {{ image_size }}"><figcaption>RGB tính đặc trưng <span>{{ image_size }}×{{ image_size }}</span></figcaption></figure>
+                  <figure class="hsv-figure"><div id="hsv-chart" role="img" aria-label="Biểu đồ phân bố HSV"></div><figcaption>Phân bố sắc độ <span>8 bins</span></figcaption></figure>
+                  <figure><img id="feature-hog" alt="Biểu diễn cạnh HOG"><figcaption id="hog-caption">Hướng gradient · HOG</figcaption></figure>
+                  <figure><img id="feature-lbp" alt="Biểu diễn kết cấu LBP"><figcaption id="lbp-caption">Mẫu nhị phân · LBP</figcaption></figure>
+                  <figure id="spatial-prior-figure" class="is-hidden"><img id="feature-spatial-prior" alt="Bản đồ trọng số theo vị trí"><figcaption>Vùng sáng có trọng số cao hơn; giả định mặt nằm giữa ảnh.</figcaption></figure>
+                </div>
+                {% if refined %}<p class="vector-meta">Ưu tiên vùng trung tâm, giữ ảnh 512×512. Điểm đã hiệu chỉnh từ gallery, không phải xác suất hay phần trăm giống nhau.</p>{% endif %}
+                <p class="vector-meta" id="vector-meta"></p><div id="extra-feature-previews" class="extra-feature-previews"></div>
+              </details>
+              <div id="warning-list" class="warning-list"></div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="view-dataset" aria-labelledby="dataset-title">
+        <div class="section-header"><div><p class="eyebrow"><span></span>Dataset health</p><h1 id="dataset-title">Bộ dữ liệu vận hành</h1><p>Ảnh, cấu hình đặc trưng và mức độ sẵn sàng của gallery đang dùng.</p></div><span class="health-badge" id="health-badge"><svg><use href="#i-check"/></svg>Đạt ngưỡng nghiệm thu</span></div>
+        <div class="stats-grid" id="stats-grid"></div><div id="gallery-issues" class="warning-list"></div>
+        <div class="dataset-grid">
+          <section class="panel chart-panel"><div class="panel-heading"><div><span class="step-number">A</span><div><h2>Phân bố gallery</h2><p>Số ảnh đã duyệt theo từng loài</p></div></div></div><div id="species-chart" class="species-chart"></div></section>
+          <section class="panel config-panel"><div class="panel-heading"><div><span class="step-number">B</span><div><h2>Cấu hình bất biến</h2><p>Vector đang dùng để so sánh</p></div></div></div><div id="config-list"></div></section>
+        </div>
+      </section>
+
+      <section class="view" id="view-processing" aria-labelledby="processing-title">
+        <div class="section-header"><div><p class="eyebrow"><span></span>Ảnh 512×512</p><h1 id="processing-title">Tách nền và lưu đặc trưng</h1><p>Dùng model hiện có, giữ ảnh nguồn và lưu PNG trong suốt vào thư mục riêng.</p></div></div>
+        <section class="panel processing-panel">
+          <div class="processing-controls">
+            <label>Phạm vi tách nền <select id="processing-scope"><option value="">Toàn bộ ảnh nguồn</option><option value="5">Thử 5 ảnh</option></select></label>
+            <button class="secondary-button" data-processing-action="remove_background" type="button">1. Tách nền</button>
+            <button class="secondary-button" data-processing-action="extract_features" type="button">2. Trích đặc trưng và lưu CSDL</button>
+            <button class="secondary-button" data-processing-action="pipeline" type="button">Chạy cả hai bước</button>
+            <button class="secondary-button" id="processing-cancel" type="button" disabled>Dừng tác vụ</button>
+          </div>
+          <p class="form-hint">Ảnh tách nền và ảnh tính đặc trưng đều 512×512. Ảnh mới được lưu pending; sau khi xem mask, chọn ảnh đạt để dùng tìm kiếm. Thử 5 ảnh sẽ nhập những cutout đang có, chưa phải bộ nghiệm thu.</p>
+          <div id="processing-summary" class="processing-summary" aria-live="polite">Đang tải trạng thái…</div>
+          <progress id="processing-progress" max="1" value="0" aria-label="Tiến độ xử lý"></progress>
+          <p id="processing-job" aria-live="polite"></p>
+          <div id="processing-error" class="processing-error is-hidden" role="status" aria-live="polite">
+            <span class="processing-notice-icon" aria-hidden="true"><svg id="processing-notice-icon"><use href="#i-info"/></svg></span>
+            <div class="processing-notice-content">
+              <div class="processing-notice-heading"><strong id="processing-notice-title"></strong><span id="processing-notice-label"></span></div>
+              <pre id="processing-notice-message"></pre>
+            </div>
+          </div>
+        </section>
+        <div class="review-toolbar">
+          <label><input id="review-ready-only" type="checkbox" checked> Chỉ ảnh đã tách nền</label>
+          <label><input id="review-select-page" type="checkbox"> Chọn các ảnh đã nhập trên trang</label>
+          <button class="secondary-button" id="review-approve" type="button">Dùng ảnh đã chọn</button>
+          <button class="secondary-button" id="review-reject" type="button">Loại ảnh đã chọn</button>
+          <button class="secondary-button" id="review-prev" type="button">Trang trước</button>
+          <span id="review-page"></span><button class="secondary-button" id="review-next" type="button">Trang sau</button>
+        </div>
+        <div id="mask-review-grid" class="mask-review-grid"></div>
+      </section>
+
+      <section class="view" id="view-history" aria-labelledby="history-title">
+        <div class="section-header"><div><p class="eyebrow"><span></span>Audit trail</p><h1 id="history-title">Lịch sử truy vấn</h1><p>Mỗi lần tìm kiếm được lưu để có thể kiểm chứng lại kết quả.</p></div><button class="secondary-button" id="refresh-history" type="button"><svg><use href="#i-history"/></svg>Làm mới</button></div>
+        <div class="history-layout">
+          <section class="panel history-list-panel"><div class="history-list-head"><span>Truy vấn gần đây</span><small id="history-count">0 bản ghi</small></div><div id="history-list" class="history-list"></div></section>
+          <section class="panel history-detail" id="history-detail"><div class="history-placeholder"><svg><use href="#i-history"/></svg><h2>Chọn một truy vấn</h2><p>Chi tiết 5 kết quả đã lưu sẽ hiển thị ở đây.</p></div></section>
+        </div>
+      </section>
+
+      <section class="view" id="view-method" aria-labelledby="method-title">
+        <div class="section-header"><div><p class="eyebrow"><span></span>Transparent by design</p><h1 id="method-title">Phương pháp truy hồi</h1><p>Một pipeline có thể giải thích, tái lập và kiểm chứng bằng dữ liệu thật.</p></div><code class="method-code">sort = (-score, image_id)</code></div>
+        <div class="method-flow" aria-label="Luồng xử lý"><article><span>01</span><svg><use href="#i-image"/></svg><h2>Chuẩn hóa</h2><p>Sửa EXIF, chọn vùng vuông và tính trên RGB {{ image_size }}×{{ image_size }}.</p></article><i></i><article><span>02</span><svg><use href="#i-flask"/></svg><h2>Trích đặc trưng</h2><p>Tạo {{ feature_info | length }} vector, tổng {{ total_dimensions }} chiều cùng cấu hình.</p></article><i></i><article><span>03</span><svg><use href="#i-database"/></svg><h2>Exact scan</h2><p>So sánh với toàn bộ gallery approved + active.</p></article><i></i><article><span>04</span><svg><use href="#i-search"/></svg><h2>Xếp hạng</h2><p>Cộng điểm có trọng số và lấy 5 ID duy nhất.</p></article></div>
+        <div class="method-cards">{% for feature in feature_info %}<article class="method-card color-{{ feature.key }}"><span>{{ feature.label }}</span><strong>{{ feature.dimension }}</strong><h2>{{ feature.description }}</h2><p>Một điểm thành phần riêng, kết hợp bằng trọng số đã chuẩn hóa. Có thể đặt trọng số 0 để so sánh các phương pháp.</p></article>{% endfor %}</div>
+        <aside class="method-note"><svg><use href="#i-info"/></svg><div><strong>Điểm tương đồng không phải xác suất.</strong><p>Hệ thống không dự đoán nhãn query và không lọc ứng viên theo loài trước khi xếp hạng. Nhãn chỉ được hiển thị để tham khảo và đánh giá.</p></div></aside>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"><span></span><div><strong id="toast-title"></strong><p id="toast-message"></p></div><button type="button" aria-label="Đóng thông báo"><svg><use href="#i-close"/></svg></button></div>
+  <noscript><div class="noscript">FaunaFind cần JavaScript để tải ảnh và hiển thị kết quả tìm kiếm.</div></noscript>
+  <script>window.__INITIAL_STATS__ = {{ stats | tojson }}; window.__PROFILE__ = {{ bundle_name | tojson }}; window.__FEATURES__ = {{ feature_info | tojson }}; window.__WEIGHT_PRESETS__ = {{ weight_presets | tojson }};</script>
+  <script src="{{ url_for('static', path='/motion.js') }}?v={{ asset_versions['motion.js'] }}" defer></script>
+  <script src="{{ url_for('static', path='/app.js') }}?v={{ asset_versions['app.js'] }}" defer></script>
+</body>
+</html>

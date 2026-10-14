@@ -1,0 +1,43 @@
+{
+  "images_checked": 700,
+  "splits": {
+    "gallery": 500,
+    "test": 100,
+    "validation": 100
+  },
+  "configs_match_code": true,
+  "vectors_recomputed": 2100,
+  "max_absolute_vector_difference": 0.0,
+  "cross_split_groups": 0,
+  "history_queries_valid": 2,
+  "sqlite_integrity": "ok",
+  "schema_migrations": [
+    {
+      "version": 1,
+      "applied_at": "2026-09-27 18:30:10"
+    },
+    {
+      "version": 2,
+      "applied_at": "2026-09-30 14:59:38"
+    }
+  ],
+  "database_logical_hash": "73c8123d8096e9e7fb4f4b5c8b01519f6848339b0ce1b3375fc472c84862d654",
+  "declared_dependency_issues": [],
+  "lock_mismatches": [],
+  "httpx_installed": "0.28.1",
+  "httpx_declared": false,
+  "lock_dependency_gaps": [],
+  "schema_matches_migrations": true,
+  "frontend_missing_static_ids": [],
+  "pytest_passed": 33,
+  "http_api_verified": true,
+  "browser_verified": false,
+  "broken_markdown_links_after_doc_fixes": [],
+  "documentation_encoding_fixed": true,
+  "remaining_findings": [
+    "httpx required by web verification is not declared in dependency files",
+    "browser interaction and clean environment recreation not checked",
+    "history metadata has no separate algorithm version, snapshot or execution environment",
+    "strict frontal-face quality and Visual P@5 remain unconfirmed"
+  ]
+}
