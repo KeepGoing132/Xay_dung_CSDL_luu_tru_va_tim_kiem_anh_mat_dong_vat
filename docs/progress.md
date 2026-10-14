@@ -1,8 +1,9 @@
-## Chuẩn bị đưa mã nguồn lên GitHub — 2026-10-14
+## Đưa mã nguồn lên GitHub — 2026-10-14
 
 - Theo yêu cầu người dùng, đưa bản dự án hiện tại lên repository `KeepGoing132/Xay_dung_CSDL_luu_tru_va_tim_kiem_anh_mat_dong_vat`, loại toàn bộ thư mục `data/` bằng quy tắc `/data/` trong `.gitignore`. README ghi rõ cần bổ sung dữ liệu riêng để chạy demo. Giữ các quy tắc bỏ qua môi trường, tệp tạm và trọng số ONNX đã có.
 - Đã kiểm tra danh sách staged: không có file trong `data/`, không có file vượt 100 MiB; quét mẫu token/private key không phát hiện file phù hợp. `git diff --cached --check` ghi nhận khoảng trắng cuối dòng/cuối file đã có trong nguồn và giấy phép font; không sửa mã hoặc giấy phép chỉ để làm sạch kiểm tra.
-- Repository đích có lịch sử tài liệu riêng với bản local; giữ cả hai lịch sử khi tích hợp, ưu tiên tài liệu hiện hành ở các đường dẫn trùng nhau. Chưa chạy lại kiểm thử ứng dụng, đánh giá ảnh hoặc model trong nhiệm vụ chỉ đưa mã nguồn lên Git. Bước tiếp theo: commit, tích hợp lịch sử đích, push nhánh `main` và đối chiếu commit remote.
+- Đã commit bản hiện tại (`6ccc7b6`), tích hợp lịch sử tài liệu của repository đích (`1fed830`), giữ bản hiện hành ở các đường dẫn trùng nhau và giữ ba tài liệu chỉ có trên remote. Push nhánh `main` thành công; `git ls-remote` xác nhận remote khớp commit local. Kiểm tra toàn bộ lịch sử đưa lên không có đường dẫn `data/`; working tree sạch sau push. Remote cũ được giữ dưới tên `previous-origin`.
+- Chưa chạy lại kiểm thử ứng dụng, đánh giá ảnh hoặc model trong nhiệm vụ chỉ đưa mã nguồn lên Git. Các tài liệu kế hoạch/demo cũ được giữ từ remote có thể mô tả thiết kế trước đây; README và nhật ký hiện hành là điểm đọc trạng thái thực tế. Bước tiếp theo khi chạy trên máy khác: bổ sung riêng `data/`, tạo môi trường và làm theo README.
 
 ## Cải tiến vùng tính đặc trưng và hiệu chỉnh điểm — 2026-10-13
 
