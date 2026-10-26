@@ -14,12 +14,13 @@ from uuid import uuid4
 from PIL import Image
 
 from .background_import import run_import
-from .config import AppConfig, BACKGROUND512_BUNDLE_NAME, NATIVE512_BUNDLE_NAME
+from .config import AppConfig, SOURCE_PREPROCESS_VERSION, BACKGROUND_MODEL_SHA256, OFFICIAL_MASK_DIRECTORY, OFFICIAL_QUERY_PIPELINE
 from .cutouts import validate_cutout
 from .errors import invalid
 from .preprocessing import preprocess_image, encode_processed_png
 from .repository import Repository
 
+QUERY_MODEL_LOCK = threading.Lock()
 
 class ProcessingCancelled(Exception):
     pass
@@ -32,28 +33,56 @@ def read_model_progress(path: Path) -> dict:
     return json.loads(complete.rsplit("\n", 1)[-1])
 
 
+
+
 class DatasetProcessingService:
     def __init__(self, config: AppConfig):
-        self.original_config = config.for_profile(NATIVE512_BUNDLE_NAME)
-        self.config = config.for_profile(BACKGROUND512_BUNDLE_NAME)
-        self.cutouts = self.config.data_root / "background_removed" / "all-images"
+        self.config = config
+        self.cutouts = config.data_root / "background_removed" / OFFICIAL_MASK_DIRECTORY
+        # Ảnh test tách riêng khỏi gallery: mask của chúng ở background_removed-test/.
+        self.test_cutouts = config.data_root / "background_removed-test" / OFFICIAL_MASK_DIRECTORY
         self.jobs_root = self.config.data_root / "processing_jobs"
         self.model_script = self.config.project_root / "animal_face_model" / "remove_background.py"
         self.model_python = self.model_script.parent / ".venv" / "Scripts" / "python.exe"
-        self._query_lock = threading.Lock()
+        self._query_lock = QUERY_MODEL_LOCK
 
     def sources(self) -> list[dict]:
-        with self.original_config.default_manifest_path.open(encoding="utf-8-sig", newline="") as stream:
+        with self.config.source_manifest_path.open(encoding="utf-8-sig", newline="") as stream:
             rows = list(csv.DictReader(stream))
         for row in rows:
             path = self.config.resolve_data_path(row["relative_path"])
-            if Path(row["relative_path"]).parts[0] != "original" or not path.is_file():
+            if not path.is_relative_to(self.config.source_root.resolve()) or not path.is_file():
                 raise ValueError(f"Missing or invalid source: {row['relative_path']}")
         return rows
 
     def cutout_path(self, row: dict) -> Path:
-        relative = Path(*Path(row["relative_path"]).parts[1:])
-        return self.cutouts / relative.parent / (relative.name + ".png")
+        relative = self.config.resolve_data_path(row["relative_path"]).relative_to(self.config.source_root.resolve())
+        root = self.test_cutouts if row.get("mask_split", row.get("split")) == "test" else self.cutouts
+        return root / relative.parent / (relative.name + ".png")
+
+    def relocate_test_cutouts(self) -> dict:
+        """Chuyển mask của ảnh test ra thư mục riêng; idempotent, kiểm checksum khi ghi đè."""
+        moved = skipped = 0
+        for row in self.sources():
+            if row.get("mask_split", row.get("split")) != "test":
+                continue
+            target = self.cutout_path(row)
+            source = self.cutouts / target.relative_to(self.test_cutouts)
+            if not source.is_file():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                if target.read_bytes() != source.read_bytes():
+                    raise ValueError(f"Test mask conflict: {self.config.relative_to_data(target)}")
+                source.unlink()
+                skipped += 1
+            else:
+                source.replace(target)
+                moved += 1
+        for directory in sorted((self.cutouts).rglob("*"), reverse=True):
+            if directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+        return {"moved": moved, "already_present": skipped}
 
     def preview_path(self, source_id: int, kind: str) -> Path:
         rows = self.sources()
@@ -71,14 +100,14 @@ class DatasetProcessingService:
             raise ValueError("Invalid review page")
         rows = self.sources()
         records = Repository(self.config).audit_image_records() if self.config.db_path.exists() else []
-        stored = {row["group_id"]: row for row in records}
+        stored = {row["original_path"]: row for row in records}
         items = []
         visible = [(index, row) for index, row in enumerate(rows)
                    if not ready_only or self.cutout_path(row).is_file()]
         for index, row in visible[offset:offset + limit]:
             cutout = self.cutout_path(row)
             checksum = sha256(cutout.read_bytes()).hexdigest() if cutout.is_file() else None
-            record = stored.get(row["group_id"])
+            record = stored.get(self.config.relative_to_data(cutout))
             if record and checksum != record["original_sha256"]:
                 record = None
             items.append({"source_id": index, "species": row["species_name"], "split": row["split"],
@@ -93,8 +122,11 @@ class DatasetProcessingService:
                 "output_folder": self.config.relative_to_data(self.cutouts),
                 "database": self.config.relative_to_data(self.config.db_path), "image_size": self.config.image_size}
 
-    def review(self, source_ids: list[int], status: str) -> dict:
+    def review(self, source_ids: list[int], status: str, *, review_note: str | None = None) -> dict:
         rows = self.sources()
+        note = "Background mask visually reviewed in the application" if review_note is None else review_note
+        if not isinstance(note, str) or not note.strip() or len(note) > 1000:
+            raise ValueError("Invalid review note")
         if not isinstance(status, str) or status not in {"approved", "rejected", "pending"} or not source_ids or len(source_ids) > len(rows):
             raise ValueError("Choose images and a valid review decision")
         if any(type(index) is not int or index < 0 or index >= len(rows) for index in source_ids):
@@ -105,6 +137,8 @@ class DatasetProcessingService:
         decisions = []
         for index in sorted(set(source_ids)):
             row = rows[index]
+            if row['split'] == 'unassigned':
+                raise ValueError(f"Assign a split before importing/reviewing: {row['relative_path']}")
             if status == "approved" and row["quality_status"] != "approved":
                 raise ValueError(f"Source has not been approved: {row['relative_path']}")
             cutout = self.cutout_path(row)
@@ -112,7 +146,7 @@ class DatasetProcessingService:
             checksum = sha256(cutout.read_bytes()).hexdigest()
             if repository.find_image_by_original_sha(checksum) is None:
                 raise ValueError(f"Features have not been imported: {self.config.relative_to_data(cutout)}")
-            decisions.append((checksum, status, "Background mask visually reviewed in the application"))
+            decisions.append((checksum, status, note))
         repository.set_image_qualities(decisions)
         # Keep manifest and DB decisions in sync for future CLI imports/evaluations.
         manifest = self.config.default_manifest_path
@@ -120,11 +154,11 @@ class DatasetProcessingService:
             with manifest.open(encoding="utf-8-sig", newline="") as stream:
                 reader = csv.DictReader(stream)
                 fields, contents = reader.fieldnames, list(reader)
-            reviewed = {rows[index]["group_id"] for index in source_ids}
+            reviewed = {self.config.relative_to_data(self.cutout_path(rows[index])) for index in source_ids}
             for row in contents:
-                if row["group_id"] in reviewed:
+                if row["relative_path"] in reviewed:
                     row["quality_status"] = status
-                    row["review_note"] = "Background mask visually reviewed in the application"
+                    row["review_note"] = note
             temporary = manifest.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8-sig", newline="") as stream:
                 writer = csv.DictWriter(stream, fieldnames=fields)
@@ -134,6 +168,7 @@ class DatasetProcessingService:
         return {"updated": len(decisions), "quality_status": status}
 
     def _model(self, arguments: list[str], log: Path, cancelled: threading.Event) -> None:
+        arguments = [*arguments, "--provider", "directml", "--threads", "2"]
         if not self.model_python.is_file() or not self.model_script.is_file():
             raise FileNotFoundError("The local background model environment is missing")
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -162,8 +197,8 @@ class DatasetProcessingService:
         result = {}
         if action in {"remove_background", "pipeline"}:
             progress_file = self.jobs_root / f"{job_id}.model-progress.jsonl"
-            arguments = ["--input", str(self.config.data_root / "original"), "--output", str(self.cutouts),
-                         "--resume", "--manifest", str(self.original_config.default_manifest_path),
+            arguments = ["--input", str(self.config.source_root), "--output", str(self.cutouts),
+                         "--resume", "--manifest", str(self.config.source_manifest_path),
                          "--progress-file", str(progress_file)]
             if limit:
                 arguments += ["--limit", str(limit)]
@@ -187,6 +222,9 @@ class DatasetProcessingService:
             watcher.start()
             try:
                 self._model(arguments, self.jobs_root / f"{job_id}.model.log", cancelled)
+                result["test_masks"] = self.relocate_test_cutouts()
+                # Mask của ảnh truy vấn được tính và cache theo yêu cầu ở
+                # background_removed/queries/{pipeline}; không seed sẵn cả bộ ảnh.
                 if progress_file.exists():
                     progress = read_model_progress(progress_file)
                     update(**progress)
@@ -204,25 +242,33 @@ class DatasetProcessingService:
                     raise ProcessingCancelled()
                 update(completed=completed, total=total, source=source, created=created, skipped=skipped, failed=failed)
 
-            result["import"] = run_import(self.config, self.original_config.default_manifest_path,
+            from .dataset_preparation import prepare_manifest_calibration
+            prepare_manifest_calibration(self.config)
+            result["import"] = run_import(self.config, self.config.source_manifest_path,
                                            self.cutouts, self.config.default_manifest_path,
                                            allow_partial=limit is not None, progress=importing, limit=limit)
         return result
 
     def query_cutout(self, payload: bytes, crop=None) -> bytes:
         # Normalize the query to the same 512 canvas used by the source gallery.
-        source = preprocess_image(payload, crop, preprocess_version=self.original_config.preprocess_version)
+        source = preprocess_image(payload, crop, preprocess_version=SOURCE_PREPROCESS_VERSION)
         rgb_png = encode_processed_png(source)
-        key = sha256(rgb_png).hexdigest()
-        output = self.config.data_root / "background_removed" / "queries"
+        pipeline = OFFICIAL_QUERY_PIPELINE
+        key = sha256((BACKGROUND_MODEL_SHA256 + pipeline).encode() + rgb_png).hexdigest()
+        output = self.config.data_root / "background_removed" / "queries" / pipeline
         cutout = output / (key + ".png.png")
-        with self._query_lock, tempfile.TemporaryDirectory(prefix="cbir-query-mask-") as directory:
+        temporary_root = self.jobs_root / "temporary"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        with self._query_lock, tempfile.TemporaryDirectory(prefix="query-mask-", dir=temporary_root) as directory:
             input_path = Path(directory) / (key + ".png")
             input_path.write_bytes(rgb_png)
-            if not cutout.exists():
-                self._model(["--input", str(input_path), "--output", str(output)],
-                            self.jobs_root / "query-model.log", threading.Event())
-            validate_cutout(input_path, cutout)
+            try:
+                if not cutout.exists():
+                    self._model(["--input", str(input_path), "--output", str(output)],
+                                self.jobs_root / "query-model.log", threading.Event())
+                validate_cutout(input_path, cutout)
+            except (OSError, ValueError) as exc:
+                raise invalid("BACKGROUND_FAILED", "Không thể tách nền ảnh truy vấn", reason=str(exc)) from exc
             return cutout.read_bytes()
 
 

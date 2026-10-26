@@ -66,9 +66,8 @@
 
       <div class="sidebar-status">
         <span class="status-dot"></span>
-        <div><strong>Hệ thống sẵn sàng</strong><small>{{ stats.approved_gallery }} ảnh trong gallery</small></div>
+        <div><strong>{{ "Sẵn sàng truy hồi" if stats.gallery_ready else "Cần chuẩn bị dữ liệu" }}</strong><small>{{ stats.approved_gallery }} ảnh trong gallery</small></div>
       </div>
-      <p class="sidebar-note">Tính trên ảnh {{ image_size }}×{{ image_size }}<br>{{ feature_info | map(attribute='label') | join(' · ') }}</p>
     </aside>
 
     <main class="main-content" id="main-content">
@@ -81,13 +80,7 @@
         <button class="motion-toggle" id="motion-toggle" type="button" aria-pressed="true" aria-label="Tắt animation" title="Tắt animation">
           <svg aria-hidden="true"><use href="#i-spark"/></svg><span>Animation</span><i aria-hidden="true"></i>
         </button>
-        <label for="profile-select">Bộ tìm kiếm</label><select id="profile-select">
-          <option value="refined512-v1" {% if bundle_name == 'refined512-v1' %}selected{% endif %}>6 đặc trưng cải tiến · 512×512</option>
-          <option value="expanded512-v1" {% if bundle_name == 'expanded512-v1' %}selected{% endif %}>6 đặc trưng · 512×512</option>
-          <option value="native512-v1" {% if bundle_name == 'native512-v1' %}selected{% endif %}>Ảnh gốc · 512×512</option>
-          <option value="background512-white-v1" {% if bundle_name == 'background512-white-v1' %}selected{% endif %}>Ảnh tách nền · 512×512</option>
-          {% if image_size != 512 %}<option value="{{ bundle_name }}" selected>{{ bundle_name }} · {{ image_size }}×{{ image_size }}</option>{% endif %}
-        </select></div>
+        <span>{{ feature_info | length }} bộ đặc trưng · 512×512</span></div>
       </header>
 
       <section class="view is-active" id="view-search" aria-labelledby="search-title">
@@ -101,7 +94,7 @@
             <div class="feature-reactor" aria-hidden="true">
               <div class="reactor-ring ring-one"></div><div class="reactor-ring ring-two"></div><div class="reactor-ring ring-three"></div>
               <div class="reactor-core"><svg><use href="#i-spark"/></svg></div>
-              <span class="reactor-label reactor-hsv">HSV</span><span class="reactor-label reactor-hog">HOG</span><span class="reactor-label reactor-lbp">LBP</span>
+              <span class="reactor-label reactor-hsv">HSV vùng</span><span class="reactor-label reactor-hog">HOG</span><span class="reactor-label reactor-gabor">Gabor</span><span class="reactor-label reactor-vlad">RootSIFT + VLAD</span>
             </div>
             <span class="intro-stat-value">{{ stats.approved_gallery }}</span>
             <span>ứng viên đã duyệt</span>
@@ -121,7 +114,7 @@
               <span class="upload-icon"><svg><use href="#i-upload"/></svg></span>
               <strong>Thả ảnh vào đây</strong>
               <span>hoặc <u>chọn từ máy tính</u></span>
-              <small>{% if automatic_background %}Ảnh thường sẽ được tự tách nền; có thể dùng PNG đã tách nền{% elif background_input %}Chọn PNG đã tách nền, có nền trong suốt{% else %}Ảnh chính diện, rõ nét sẽ cho kết quả tốt hơn{% endif %}</small>
+              <small>Mỗi query tự động tách nền bằng BiRefNet-general-lite, cùng pipeline với dataset.</small>
             </label>
 
             <div class="image-preview is-hidden" id="image-preview-wrap">
@@ -147,20 +140,22 @@
               <label class="weight-preset-label" for="weight-preset">So sánh nhanh</label>
               <select id="weight-preset">{% for preset in weight_presets %}<option value="{{ loop.index0 }}">{{ preset.label }}</option>{% endfor %}<option value="custom" disabled>Tùy chỉnh</option></select>
               {% if preset_warning %}<p class="form-hint">{{ preset_warning }}</p>{% endif %}
+              {% if feature_info | length > 6 %}<details class="advanced-weights"><summary>Điều chỉnh {{ feature_info | length }} trọng số</summary>{% endif %}
               {% for feature in feature_info %}
               <label class="weight-control color-{{ feature.key }}"><span><i></i>{{ feature.label }} <small>{{ feature.description }}</small><output id="{{ feature.key }}-output">{{ (feature.weight * 100) | round | int }}%</output></span><input id="{{ feature.key }}-weight" name="{{ feature.key }}" type="range" min="0" max="1" step="any" value="{{ feature.weight }}"></label>
               {% endfor %}
+              {% if feature_info | length > 6 %}</details>{% endif %}
               <p class="form-hint"><svg><use href="#i-info"/></svg>Trọng số được chuẩn hóa tự động trước khi xếp hạng.</p>
             </div>
 
             <button class="search-button" id="search-button" type="submit" disabled>
               <span class="button-label"><svg><use href="#i-spark"/></svg>Tìm 5 ảnh gần nhất</span>
-              <span class="button-loading"><i></i>Đang phân tích ảnh…</span>
+              <span class="button-loading"><i></i>Đang tách nền và tìm kiếm…</span>
             </button>
           </form>
 
           <section class="results-panel panel" aria-live="polite" aria-busy="false">
-            <div class="search-scanner" aria-hidden="true"><span></span><svg><use href="#i-search"/></svg><strong>Đang phân tích ảnh</strong><small>{{ feature_info | length }} nhóm đặc trưng</small><div><i></i><i></i><i></i></div></div>
+            <div class="search-scanner" aria-hidden="true"><span></span><svg><use href="#i-search"/></svg><strong>Đang xử lý ảnh</strong><small>Tách nền · {{ feature_info | length }} bộ mô tả</small><div><i></i><i></i><i></i></div></div>
             <div class="empty-results" id="empty-results">
               <div class="orbit-visual" aria-hidden="true"><span></span><span></span><span></span><svg><use href="#i-image"/></svg></div>
               <p class="eyebrow"><span></span>Ready to explore</p>
@@ -172,7 +167,7 @@
             <div class="results-content is-hidden" id="results-content">
               <div class="results-heading">
                 <div><p class="eyebrow"><span></span>Retrieval complete</p><h2>5 kết quả gần nhất</h2><p id="result-summary"></p></div>
-                <button id="export-results" class="secondary-button" type="button">Xuất kết quả JSON</button><div class="query-id"><small>QUERY ID</small><strong id="query-id">#—</strong></div>
+                <div class="query-id"><small>QUERY ID</small><strong id="query-id">#—</strong></div>
               </div>
               <div class="result-grid" id="result-grid"></div>
               <div class="metric-row" id="metric-row"></div>
@@ -187,13 +182,12 @@
                 <summary><span><span class="step-number">03</span><span><strong>Đặc trưng truy vấn</strong><small>Ảnh sau tiền xử lý và biểu diễn trung gian</small></span></span><svg><use href="#i-chevron"/></svg></summary>
                 <div class="feature-grid">
                   <figure><img id="feature-rgb" alt="Ảnh RGB {{ image_size }} nhân {{ image_size }}"><figcaption>RGB tính đặc trưng <span>{{ image_size }}×{{ image_size }}</span></figcaption></figure>
-                  <figure class="hsv-figure"><div id="hsv-chart" role="img" aria-label="Biểu đồ phân bố HSV"></div><figcaption>Phân bố sắc độ <span>8 bins</span></figcaption></figure>
+                  <figure class="hsv-figure"><div id="hsv-chart" role="img" aria-label="Biểu đồ sắc độ tổng hợp từ HSV vùng"></div><figcaption>HSV vùng · tổng hợp sắc độ <span>8 bins</span></figcaption></figure>
+                  <figure class="vlad-figure is-hidden" id="vlad-figure"><div id="vlad-chart" role="img" aria-label="Khối lượng phần dư VLAD theo cụm"></div><figcaption id="vlad-caption">RootSIFT + VLAD · 32 cụm</figcaption></figure>
                   <figure><img id="feature-hog" alt="Biểu diễn cạnh HOG"><figcaption id="hog-caption">Hướng gradient · HOG</figcaption></figure>
-                  <figure><img id="feature-lbp" alt="Biểu diễn kết cấu LBP"><figcaption id="lbp-caption">Mẫu nhị phân · LBP</figcaption></figure>
                   <figure id="spatial-prior-figure" class="is-hidden"><img id="feature-spatial-prior" alt="Bản đồ trọng số theo vị trí"><figcaption>Vùng sáng có trọng số cao hơn; giả định mặt nằm giữa ảnh.</figcaption></figure>
                 </div>
-                {% if refined %}<p class="vector-meta">Ưu tiên vùng trung tâm, giữ ảnh 512×512. Điểm đã hiệu chỉnh từ gallery, không phải xác suất hay phần trăm giống nhau.</p>{% endif %}
-                <p class="vector-meta" id="vector-meta"></p><div id="extra-feature-previews" class="extra-feature-previews"></div>
+                <div id="extra-feature-previews" class="extra-feature-previews"></div>
               </details>
               <div id="warning-list" class="warning-list"></div>
             </div>
@@ -214,16 +208,30 @@
         <div class="section-header"><div><p class="eyebrow"><span></span>Ảnh 512×512</p><h1 id="processing-title">Tách nền và lưu đặc trưng</h1><p>Dùng model hiện có, giữ ảnh nguồn và lưu PNG trong suốt vào thư mục riêng.</p></div></div>
         <section class="panel processing-panel">
           <div class="processing-controls">
-            <label>Phạm vi tách nền <select id="processing-scope"><option value="">Toàn bộ ảnh nguồn</option><option value="5">Thử 5 ảnh</option></select></label>
-            <button class="secondary-button" data-processing-action="remove_background" type="button">1. Tách nền</button>
-            <button class="secondary-button" data-processing-action="extract_features" type="button">2. Trích đặc trưng và lưu CSDL</button>
-            <button class="secondary-button" data-processing-action="pipeline" type="button">Chạy cả hai bước</button>
-            <button class="secondary-button" id="processing-cancel" type="button" disabled>Dừng tác vụ</button>
+            <label for="processing-scope">Phạm vi tách nền <select id="processing-scope"><option value="">Toàn bộ ảnh nguồn</option><option value="5">Thử 5 ảnh</option></select></label>
+            <div class="processing-actions">
+              <button class="secondary-button" data-processing-action="remove_background" type="button">1. Tách nền</button>
+              <button class="secondary-button" data-processing-action="extract_features" type="button">2. Trích đặc trưng và lưu CSDL</button>
+              <button class="secondary-button" data-processing-action="pipeline" type="button">Chạy cả hai bước</button>
+              <button class="secondary-button" id="processing-cancel" type="button" disabled>Dừng tác vụ</button>
+            </div>
           </div>
-          <p class="form-hint">Ảnh tách nền và ảnh tính đặc trưng đều 512×512. Ảnh mới được lưu pending; sau khi xem mask, chọn ảnh đạt để dùng tìm kiếm. Thử 5 ảnh sẽ nhập những cutout đang có, chưa phải bộ nghiệm thu.</p>
-          <div id="processing-summary" class="processing-summary" aria-live="polite">Đang tải trạng thái…</div>
-          <progress id="processing-progress" max="1" value="0" aria-label="Tiến độ xử lý"></progress>
-          <p id="processing-job" aria-live="polite"></p>
+          <p class="form-hint">Ảnh được xử lý ở 512×512. Sau khi lưu đặc trưng, xem mask bên dưới và duyệt ảnh đạt để dùng tìm kiếm.</p>
+          <div id="processing-summary" class="processing-summary" aria-label="Trạng thái bộ ảnh" aria-live="polite">
+            <div class="processing-stat"><span>Đã tách nền</span><strong id="processing-cutout-count">—</strong><small id="processing-source-count">Đang tải trạng thái</small></div>
+            <div class="processing-stat"><span>Đã lưu đặc trưng</span><strong id="processing-imported-count">—</strong><small>Ảnh gallery trong CSDL</small></div>
+            <div class="processing-stat"><span>Sẵn sàng tìm kiếm</span><strong id="processing-approved-count">—</strong><small>Ảnh gallery đã duyệt</small></div>
+          </div>
+          <div class="processing-job-section" aria-live="polite">
+            <div class="processing-job-heading"><span>Tiến độ tác vụ</span><span id="processing-job-status" class="processing-job-status">Đang tải</span></div>
+            <p id="processing-job">Đang tải trạng thái…</p>
+            <div id="processing-progress-block" class="is-hidden">
+              <div class="processing-progress-meta"><span id="processing-progress-count"></span><span id="processing-progress-percent"></span></div>
+              <progress id="processing-progress" max="1" value="0" aria-label="Tiến độ xử lý"></progress>
+            </div>
+            <p id="processing-source" class="processing-source is-hidden"></p>
+          </div>
+          <details class="processing-details"><summary>Vị trí lưu dữ liệu</summary><dl><div><dt>Ảnh tách nền</dt><dd id="processing-output-folder">—</dd></div><div><dt>Cơ sở dữ liệu</dt><dd id="processing-database">—</dd></div></dl></details>
           <div id="processing-error" class="processing-error is-hidden" role="status" aria-live="polite">
             <span class="processing-notice-icon" aria-hidden="true"><svg id="processing-notice-icon"><use href="#i-info"/></svg></span>
             <div class="processing-notice-content">
@@ -253,7 +261,7 @@
 
       <section class="view" id="view-method" aria-labelledby="method-title">
         <div class="section-header"><div><p class="eyebrow"><span></span>Transparent by design</p><h1 id="method-title">Phương pháp truy hồi</h1><p>Một pipeline có thể giải thích, tái lập và kiểm chứng bằng dữ liệu thật.</p></div><code class="method-code">sort = (-score, image_id)</code></div>
-        <div class="method-flow" aria-label="Luồng xử lý"><article><span>01</span><svg><use href="#i-image"/></svg><h2>Chuẩn hóa</h2><p>Sửa EXIF, chọn vùng vuông và tính trên RGB {{ image_size }}×{{ image_size }}.</p></article><i></i><article><span>02</span><svg><use href="#i-flask"/></svg><h2>Trích đặc trưng</h2><p>Tạo {{ feature_info | length }} vector, tổng {{ total_dimensions }} chiều cùng cấu hình.</p></article><i></i><article><span>03</span><svg><use href="#i-database"/></svg><h2>Exact scan</h2><p>So sánh với toàn bộ gallery approved + active.</p></article><i></i><article><span>04</span><svg><use href="#i-search"/></svg><h2>Xếp hạng</h2><p>Cộng điểm có trọng số và lấy 5 ID duy nhất.</p></article></div>
+        <div class="method-flow" aria-label="Luồng xử lý"><article><span>01</span><svg><use href="#i-image"/></svg><h2>Tách nền</h2><p>Sửa EXIF, crop vuông, RGB 512×512 → BiRefNet-general-lite → ghép nền trắng; dataset và query dùng cùng thuật toán.</p></article><i></i><article><span>02</span><svg><use href="#i-flask"/></svg><h2>Trích đặc trưng</h2><p>Tạo {{ feature_info | length }} vector, tổng {{ total_dimensions }} chiều cùng cấu hình.</p></article><i></i><article><span>03</span><svg><use href="#i-database"/></svg><h2>Exact scan</h2><p>So sánh với toàn bộ gallery approved + active.</p></article><i></i><article><span>04</span><svg><use href="#i-search"/></svg><h2>Xếp hạng</h2><p>Cộng điểm có trọng số và lấy 5 ID duy nhất.</p></article></div>
         <div class="method-cards">{% for feature in feature_info %}<article class="method-card color-{{ feature.key }}"><span>{{ feature.label }}</span><strong>{{ feature.dimension }}</strong><h2>{{ feature.description }}</h2><p>Một điểm thành phần riêng, kết hợp bằng trọng số đã chuẩn hóa. Có thể đặt trọng số 0 để so sánh các phương pháp.</p></article>{% endfor %}</div>
         <aside class="method-note"><svg><use href="#i-info"/></svg><div><strong>Điểm tương đồng không phải xác suất.</strong><p>Hệ thống không dự đoán nhãn query và không lọc ứng viên theo loài trước khi xếp hạng. Nhãn chỉ được hiển thị để tham khảo và đánh giá.</p></div></aside>
       </section>

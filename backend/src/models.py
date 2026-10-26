@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import json
 from hashlib import sha256
+from .config import DEFAULT_WEIGHTS, PREPROCESS_VERSION
 
 
 @dataclass(frozen=True)
@@ -32,86 +33,98 @@ class FeatureConfig:
     dimension: int
     parameters: dict[str, Any]
     preprocess_version: str
+    projection: Any = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
 class BundleConfig:
     name: str
-    hsv: FeatureConfig
-    hog: FeatureConfig
-    lbp: FeatureConfig
-    extras: dict[str, FeatureConfig] = field(default_factory=dict)
+    configs: dict[str, FeatureConfig]
+
+    @classmethod
+    def from_configs(cls, name, configs):
+        from .config import FEATURE_KEYS
+        if set(configs) != set(FEATURE_KEYS):
+            raise ValueError("A bundle must contain exactly the four configured descriptors")
+        return cls(name, dict(configs))
 
     @property
-    def configs(self) -> dict[str, FeatureConfig]:
-        return {"hsv": self.hsv, "hog": self.hog, "lbp": self.lbp, **self.extras}
+    def hog(self):
+        return self.configs["hog"]
 
     @property
-    def preprocess_version(self) -> str:
-        versions = {config.preprocess_version for config in self.configs.values()}
+    def preprocess_version(self):
+        versions = {c.preprocess_version for c in self.configs.values()}
         if len(versions) != 1:
-            raise ValueError("Bundle contains mixed preprocessing versions")
+            raise ValueError("Mixed preprocessing versions")
         return next(iter(versions))
 
     @property
-    def config_ids(self) -> dict[str, int]:
-        return {name: config.config_id for name, config in self.configs.items()}
+    def config_ids(self):
+        return {key: value.config_id for key, value in self.configs.items()}
 
     @property
-    def signature(self) -> str:
-        specs = {name: {"name": spec.name, "dimension": spec.dimension, "parameters": spec.parameters,
-                        "preprocess_version": spec.preprocess_version, "feature_type": spec.feature_type}
-                 for name, spec in self.configs.items()}
+    def signature(self):
+        specs = {key: {"name": c.name, "dimension": c.dimension, "parameters": c.parameters,
+                       "preprocess_version": c.preprocess_version, "feature_type": c.feature_type}
+                 for key, c in self.configs.items()}
         return sha256(json.dumps(specs, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
 class FeatureBundle:
-    hsv: np.ndarray
-    hog: np.ndarray
-    lbp: np.ndarray
+    vectors: dict[str, np.ndarray]
     config_ids: dict[str, int]
     warnings: tuple[str, ...] = ()
-    preprocess_version: str = "preprocess-v1"
-    extras: dict[str, np.ndarray] = field(default_factory=dict)
+    preprocess_version: str = PREPROCESS_VERSION
     similarities: dict[str, dict[str, Any]] = field(default_factory=dict)
     config_signature: str = ""
 
+    @classmethod
+    def from_vectors(cls, vectors, **kwargs):
+        from .config import FEATURE_KEYS
+        if set(vectors) != set(FEATURE_KEYS) or set(kwargs["config_ids"]) != set(vectors):
+            raise ValueError("Vectors/config IDs must contain exactly four descriptors")
+        return cls(dict(vectors), **kwargs)
+
     @property
-    def vectors(self) -> dict[str, np.ndarray]:
-        return {"hsv": self.hsv, "hog": self.hog, "lbp": self.lbp, **self.extras}
+    def extras(self):
+        """Vector nhỏ để xem trước; VLAD 4.096 chiều có biểu diễn cụm riêng."""
+        return {k: v for k, v in self.vectors.items() if k not in {"hog", "rootsift_vlad"}}
 
 
 @dataclass(frozen=True)
 class Weights:
-    hsv: float = 1 / 3
-    hog: float = 1 / 3
-    lbp: float = 1 / 3
-    extras: dict[str, float] = field(default_factory=dict)
+    values: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
 
-    def as_dict(self) -> dict[str, float]:
-        return {"hsv": self.hsv, "hog": self.hog, "lbp": self.lbp, **self.extras}
+    def as_dict(self):
+        return dict(self.values)
 
     @classmethod
-    def from_dict(cls, values: dict[str, float]) -> "Weights":
-        return cls(*(values.get(key, 0.0) for key in ("hsv", "hog", "lbp")),
-                   extras={key: value for key, value in values.items() if key not in {"hsv", "hog", "lbp"}})
+    def from_dict(cls, values):
+        from .config import FEATURE_KEYS
+        from .errors import invalid
+        unknown = set(values) - set(FEATURE_KEYS)
+        if unknown:
+            raise invalid("INVALID_WEIGHTS", "Trọng số không thuộc bốn đặc trưng", features=sorted(unknown))
+        return cls({key: float(values.get(key, 0)) for key in FEATURE_KEYS})
 
 
 @dataclass(frozen=True)
 class Scores:
-    hsv: float
-    hog: float
-    lbp: float
+    values: dict[str, float]
     total: float
-    extras: dict[str, float] = field(default_factory=dict)
 
-    def as_dict(self) -> dict[str, float]:
-        return {"hsv": self.hsv, "hog": self.hog, "lbp": self.lbp, **self.extras}
+    def as_dict(self):
+        return dict(self.values)
 
-    def contributions(self, weights: Weights) -> dict[str, float]:
+    def contributions(self, weights):
         values = weights.as_dict()
-        return {name: score * values.get(name, 0.0) for name, score in self.as_dict().items()}
+        return {key: score * values.get(key, 0) for key, score in self.values.items()}
+
+    @classmethod
+    def from_components(cls, components, total):
+        return cls(dict(components), total)
 
 
 @dataclass(frozen=True)
@@ -139,8 +152,8 @@ class LoadCandidatesResult:
 class SearchRequest:
     image_bytes: bytes
     crop: CropBox | None = None
-    weights: Weights = field(default_factory=Weights)
-    bundle_name: str = "baseline-v1"
+    weights: Weights | None = None
+    bundle_name: str | None = None
 
 
 @dataclass(frozen=True)

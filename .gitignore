@@ -1,8 +1,11 @@
 /tmp/
 /data/
+/docs/
+/docx/
 .venv/
 animal_face_model/*.onnx
 data/background_removed/
+data/background_removed-test/
 data/processing_jobs/
 __pycache__/
 *.py[cod]
@@ -23,7 +26,8 @@ data/demo/
 data/*.db
 data/*.db-*
 artifacts/figures/
-artifacts/evaluation/*.csv
-artifacts/evaluation/*.json
+artifacts/evaluation/**
+artifacts/report-evidence/
 artifacts/evaluation/*.md
 !artifacts/evaluation/.gitkeep
+/animal_face_model/runtime-directml/

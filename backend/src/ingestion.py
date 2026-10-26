@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import csv
+from concurrent.futures import ProcessPoolExecutor
 import json
 from hashlib import sha256
 from pathlib import Path
-from io import BytesIO
 from typing import Callable
 
-from PIL import Image
-
-from .config import BUNDLE_NAME, NATIVE512_BUNDLE_NAME, AppConfig
+from .config import AppConfig
 from .errors import AppError, invalid
 from .features import extract_features
 from .models import CropBox, ImageMetadata, ImportErrorRecord, ImportSummary
@@ -33,9 +31,10 @@ REQUIRED_COLUMNS = {
 
 
 class IngestionService:
-    def __init__(self, config: AppConfig, repository: Repository):
+    def __init__(self, config: AppConfig, repository: Repository, features_by_sha=None):
         self.config = config
         self.repository = repository
+        self.features_by_sha = features_by_sha
 
     @staticmethod
     def _crop_from_row(row: dict[str, str]) -> CropBox | None:
@@ -59,7 +58,7 @@ class IngestionService:
         return self.import_rows(rows, progress)
 
     def import_rows(self, rows: list[dict], progress: Callable | None = None) -> ImportSummary:
-        bundle = self.repository.ensure_baseline_bundle()
+        bundle = self.repository.ensure_bundle()
         errors: list[ImportErrorRecord] = []
         created = skipped = failed = 0
 
@@ -87,27 +86,20 @@ class IngestionService:
                 processed = preprocess_image(
                     image_bytes, self._crop_from_row(row), preprocess_version=self.config.preprocess_version
                 )
-                processed_relative = Path("processed") / row["split"] / row["species_name"].strip().casefold() / f"{original_path.stem}.png"
-                if self.config.bundle_name != BUNDLE_NAME:
-                    processed_relative = Path("processed") / self.config.bundle_name / row["split"] / row["species_name"].strip().casefold() / f"{original_path.stem}-{original_sha[:12]}.png"
-                reuse_source = False
-                if self.config.image_size == 512 and not self.config.background_input:
-                    with Image.open(BytesIO(image_bytes)) as source:
-                        reuse_source = (source.mode == "RGB" and source.size == (512, 512)
-                                        and source.tobytes() == processed.rgb.tobytes())
-                if reuse_source:
-                    processed_path = original_path
+                processed_relative = Path("processed") / self.config.bundle_name / row["split"] / row["species_name"].strip().casefold() / f"{original_path.stem}-{original_sha[:12]}.png"
+                processed_path = self.config.resolve_data_path(processed_relative.as_posix())
+                processed_path.parent.mkdir(parents=True, exist_ok=True)
+                encoded = encode_processed_png(processed)
+                if processed_path.exists():
+                    if processed_path.read_bytes() != encoded:
+                        raise invalid("PROCESSED_CONFLICT", "Ảnh xử lý đã tồn tại với nội dung khác", path=processed_relative.as_posix())
                 else:
-                    processed_path = self.config.resolve_data_path(processed_relative.as_posix())
-                    processed_path.parent.mkdir(parents=True, exist_ok=True)
-                    encoded = encode_processed_png(processed)
-                    if processed_path.exists():
-                        if processed_path.read_bytes() != encoded:
-                            raise invalid("PROCESSED_CONFLICT", "Ảnh xử lý đã tồn tại với nội dung khác", path=processed_relative.as_posix())
-                    else:
-                        processed_path.write_bytes(encoded)
-                        owns_processed = True
-                features = extract_features(processed, bundle)
+                    processed_path.write_bytes(encoded)
+                    owns_processed = True
+                features = (self.features_by_sha[original_sha] if self.features_by_sha is not None
+                            else extract_features(processed, bundle))
+                if features.config_signature != bundle.signature:
+                    raise invalid("CONFIG_MISMATCH", "Đặc trưng không khớp toàn bộ cấu hình nhập")
                 metadata = ImageMetadata(
                     species_name=row["species_name"].strip() or None,
                     original_path=self.config.relative_to_data(original_path),
@@ -149,3 +141,31 @@ class IngestionService:
             failed=failed,
             errors=tuple(errors),
         )
+
+
+def _extract_import_row(job):
+    config, bundle, row = job
+    path = config.resolve_data_path(row["relative_path"])
+    try:
+        payload = path.read_bytes()
+        image = preprocess_image(payload, IngestionService._crop_from_row(row), preprocess_version=config.preprocess_version)
+        return sha256(payload).hexdigest(), extract_features(image, bundle)
+    except Exception as exc:
+        raise ValueError(f"Feature extraction failed: {row['relative_path']}: {exc}") from exc
+
+
+def extract_import_features(config, repository, rows, workers=4):
+    """Parallel numeric extraction; ordered writes still use normal ingestion validation."""
+    bundle = repository.ensure_bundle()
+    pending = [row for row in rows if repository.find_image_by_original_sha(
+        sha256(config.resolve_data_path(row["relative_path"]).read_bytes()).hexdigest()) is None]
+    if not pending:
+        return {}
+    result = {}
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        jobs = ((config, bundle, row) for row in pending)
+        for index, (digest, features) in enumerate(executor.map(_extract_import_row, jobs), 1):
+            result[digest] = features
+            if index % 25 == 0:
+                print(f"Prepared import vectors {index}/{len(pending)}", flush=True)
+    return result

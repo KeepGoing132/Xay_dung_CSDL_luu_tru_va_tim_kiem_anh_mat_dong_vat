@@ -7,7 +7,7 @@ import json
 
 import numpy as np
 
-from .config import REFINED512_BUNDLE_NAME
+from .config import OFFICIAL_BUNDLE_NAME
 from .errors import invalid
 from .similarity import feature_distance
 
@@ -24,7 +24,7 @@ def calibration_path(config):
     return config.data_root / "calibration" / config.bundle_name / "gallery.json"
 
 
-def fit_calibration(vectors, specs, settings=None):
+def fit_calibration(vectors, specs, settings=None, *, profile=OFFICIAL_BUNDLE_NAME):
     """Rows must be gallery-only, in deterministic order; caller records their provenance."""
     settings = settings or CALIBRATION_SETTINGS
     keys = list(specs)
@@ -59,14 +59,12 @@ def fit_calibration(vectors, specs, settings=None):
                             "distance_median": float(np.median(distances)),
                             "distance_p90": float(np.percentile(distances, 90)),
                             "score_median": float(np.median(np.exp(-np.log(2)*distances/metric["scale"])))}
-    return {"schema_version": 1, "profile": REFINED512_BUNDLE_NAME, "source_split": "gallery",
+    return {"schema_version": 1, "profile": profile, "source_split": "gallery",
             "descriptor_sha256": canonical_hash(specs), "n_gallery": n, "n_pairs": len(pairs),
             "settings": settings, "metrics": metrics, "diagnostics": diagnostics}
 
 
 def calibrated_specs(config, specs):
-    if config.bundle_name != REFINED512_BUNDLE_NAME:
-        return specs
     path = calibration_path(config)
     try:
         artifact = json.loads(path.read_text(encoding="utf-8"))
@@ -89,5 +87,6 @@ def calibrated_specs(config, specs):
             spec["parameters"]["calibration_sha256"] = canonical_hash(artifact)
         return result
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise invalid("CONFIG_MISMATCH", "Thiếu hoặc sai hiệu chỉnh; chạy scripts/prepare_refined_profile.py",
+        command = "scripts/prepare_dataset.py"
+        raise invalid("CONFIG_MISMATCH", "Thiếu hoặc sai hiệu chỉnh; chạy " + command,
                       path=str(path), reason=str(exc)) from exc

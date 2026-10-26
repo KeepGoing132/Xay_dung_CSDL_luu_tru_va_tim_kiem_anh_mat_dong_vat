@@ -12,9 +12,8 @@ def main() -> None:
     config.ensure_runtime_dirs()
     repository = Repository(config)
     repository.create_schema()
-    bundle = repository.ensure_baseline_bundle()
     print(f"Database: {config.db_path}")
-    print(f"Bundle: {bundle.name} {bundle.config_ids}")
+    print("Schema ready; run scripts/prepare_dataset.py before retrieval")
 
 
 if __name__ == "__main__":

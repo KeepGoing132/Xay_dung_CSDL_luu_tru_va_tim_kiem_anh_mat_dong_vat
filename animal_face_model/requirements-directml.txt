@@ -1,0 +1,3 @@
+# Isolated Windows runtime for official foreground12; preserve the legacy CPU environment.
+# uv pip install --python animal_face_model/.venv/Scripts/python.exe --target animal_face_model/runtime-directml --no-deps -r animal_face_model/requirements-directml.txt
+onnxruntime-directml==1.24.4

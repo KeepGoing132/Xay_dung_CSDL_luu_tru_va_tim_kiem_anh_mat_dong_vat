@@ -7,19 +7,15 @@
   const featureInfo = window.__FEATURES__;
   const featureKeys = featureInfo.map((item) => item.key);
   const featureLabel = (key) => featureInfo.find((item) => item.key === key)?.label || key;
-  let latestResult = null;
   const apiUrl = (url) => `${url}${url.includes("?") ? "&" : "?"}profile=${encodeURIComponent(profile)}`;
-  $("#profile-select").addEventListener("change", (event) => {
-    const url = new URL(location.href);
-    url.searchParams.set("profile", event.target.value);
-    location.href = url.toString();
-  });
   const state = {
     stats: window.__INITIAL_STATS__ || {},
     history: [],
     imageWidth: 0,
     imageHeight: 0,
     previewUrl: null,
+    imageReady: false,
+    searching: false,
     toastTimer: null,
   };
 
@@ -122,21 +118,24 @@
 
   function showSelectedImage(file) {
     if (!file) return clearImage();
+    resetImagePreview();
     if (!/^image\/(jpeg|png|webp)$/.test(file.type)) {
       showToast("Tệp không được hỗ trợ", "Hãy chọn ảnh JPG, PNG hoặc WebP.", true);
-      imageInput.value = "";
+      clearImage();
       return;
     }
     if (file.size > 20 * 1024 * 1024) {
       showToast("Ảnh quá lớn", "Kích thước tối đa là 20 MB.", true);
-      imageInput.value = "";
+      clearImage();
       return;
     }
-    if (state.previewUrl) URL.revokeObjectURL(state.previewUrl);
-    state.previewUrl = URL.createObjectURL(file);
+    const previewUrl = URL.createObjectURL(file);
+    state.previewUrl = previewUrl;
     imagePreview.onload = () => {
+      if (state.previewUrl !== previewUrl) return;
       state.imageWidth = imagePreview.naturalWidth;
       state.imageHeight = imagePreview.naturalHeight;
+      state.imageReady = true;
       setupCropControls();
       $("#image-meta").textContent = `${file.name} · ${state.imageWidth}×${state.imageHeight}`;
       $("#image-preview-wrap").classList.remove("is-hidden");
@@ -145,14 +144,22 @@
       updateSearchButton();
       requestAnimationFrame(updateCropFrame);
     };
-    imagePreview.src = state.previewUrl;
+    imagePreview.onerror = () => {
+      if (state.previewUrl !== previewUrl) return;
+      clearImage();
+      showToast("Không đọc được ảnh", "Tệp có thể bị hỏng. Hãy chọn một ảnh JPG, PNG hoặc WebP khác.", true);
+    };
+    imagePreview.src = previewUrl;
   }
 
-  function clearImage() {
+  function resetImagePreview() {
     if (state.previewUrl) URL.revokeObjectURL(state.previewUrl);
     state.previewUrl = null;
-    imageInput.value = "";
+    state.imageWidth = state.imageHeight = 0;
+    state.imageReady = false;
+    imagePreview.onload = imagePreview.onerror = null;
     imagePreview.removeAttribute("src");
+    $("#image-meta").textContent = "";
     $("#image-preview-wrap").classList.add("is-hidden");
     uploadZone.classList.remove("is-hidden");
     $("#clear-image").classList.add("is-hidden");
@@ -160,6 +167,10 @@
     $("#crop-controls").classList.add("is-disabled");
     $("#crop-frame").classList.add("is-hidden");
     updateSearchButton();
+  }
+  function clearImage() {
+    imageInput.value = "";
+    resetImagePreview();
   }
   $("#clear-image").addEventListener("click", clearImage);
 
@@ -196,9 +207,12 @@
     }
     const imageRect = imagePreview.getBoundingClientRect();
     const wrapRect = $("#image-preview-wrap").getBoundingClientRect();
-    const scale = imageRect.width / state.imageWidth;
-    const x = Number($("#crop-x").value) * scale + imageRect.left - wrapRect.left;
-    const y = Number($("#crop-y").value) * scale + imageRect.top - wrapRect.top;
+    // object-fit: contain centers the pixels inside the image element's box.
+    const scale = Math.min(imageRect.width / state.imageWidth, imageRect.height / state.imageHeight);
+    const insetX = (imageRect.width - state.imageWidth * scale) / 2;
+    const insetY = (imageRect.height - state.imageHeight * scale) / 2;
+    const x = Number($("#crop-x").value) * scale + imageRect.left - wrapRect.left + insetX;
+    const y = Number($("#crop-y").value) * scale + imageRect.top - wrapRect.top + insetY;
     const size = Number($("#crop-size").value) * scale;
     Object.assign(frame.style, { left: `${x}px`, top: `${y}px`, width: `${size}px`, height: `${size}px` });
     frame.classList.remove("is-hidden");
@@ -244,7 +258,7 @@
 
   function updateSearchButton() {
     const hasWeight = weightInputs.some((input) => Number(input.value) > 0);
-    $("#search-button").disabled = !imageInput.files.length || !state.stats.gallery_ready || !hasWeight;
+    $("#search-button").disabled = state.searching || !state.imageReady || !imageInput.files.length || !state.stats.gallery_ready || !hasWeight;
   }
 
   $("#search-form").addEventListener("submit", async (event) => {
@@ -261,6 +275,7 @@
       payload.append("crop_size", $("#crop-size").value);
     }
 
+    state.searching = true;
     button.classList.add("is-loading");
     button.disabled = true;
     $(".results-panel").setAttribute("aria-busy", "true");
@@ -275,6 +290,7 @@
     } catch (error) {
       showToast("Không thể tìm kiếm", error.message, true);
     } finally {
+      state.searching = false;
       button.classList.remove("is-loading");
       $(".results-panel").setAttribute("aria-busy", "false");
       document.body.classList.remove("is-searching");
@@ -292,7 +308,6 @@
   }
 
   function renderSearchResults(data) {
-    latestResult = {profile, ...data};
     $("#empty-results").classList.add("is-hidden");
     $("#results-content").classList.remove("is-hidden");
     $("#query-id").textContent = `#${data.query_id}`;
@@ -327,14 +342,11 @@
 
     $("#feature-rgb").src = data.query.rgb;
     $("#feature-hog").src = data.query.hog;
-    $("#feature-lbp").src = data.query.lbp;
     $("#hog-caption").textContent = data.query.preview_notes?.hog || "Hướng gradient · HOG";
-    $("#lbp-caption").textContent = data.query.preview_notes?.lbp || "Mẫu nhị phân · LBP";
     $("#spatial-prior-figure").classList.toggle("is-hidden", !data.query.spatial_prior);
     if (data.query.spatial_prior) $("#feature-spatial-prior").src = data.query.spatial_prior;
-    renderHsvChart(data.query.hsv_bins);
-    const dims = data.query.dimensions;
-    $("#vector-meta").textContent = `Kích thước vector · ${featureKeys.map((key) => `${featureLabel(key)} ${dims[key].toLocaleString("vi-VN")}`).join(" · ")} · Tổng ${Object.values(dims).reduce((a, b) => a + b, 0).toLocaleString("vi-VN")}`;
+    renderRegionalHsvChart(data.query.spatial_hsv_bins);
+    renderVladChart(data.query.rootsift_vlad_clusters, data.query.preview_notes?.rootsift_vlad);
     $("#extra-feature-previews").innerHTML = Object.entries(data.query.extra_vectors || {}).map(([key, values]) => {
       const maximum = Math.max(...values, .001);
       return `<article class="extra-feature color-${key}"><strong>${escapeHtml(featureLabel(key))} · ${values.length} chiều</strong><p>Giá trị vector theo thứ tự cấu hình; rê chuột vào cột để xem từng chiều.</p><div class="vector-scroll"><div class="vector-bars">${values.map((value, index) => `<i style="height:${Math.max(value / maximum * 90, 1)}px" title="Chiều ${index}: ${value.toFixed(6)}"></i>`).join("")}</div></div></article>`;
@@ -350,15 +362,19 @@
     $("#results-content").scrollIntoView({ behavior: window.FaunaMotion?.scrollBehavior() || "auto", block: "start" });
   }
 
-  $("#export-results").addEventListener("click", () => {
-    if (!latestResult) return;
-    const url = URL.createObjectURL(new Blob([JSON.stringify(latestResult, null, 2)], {type: "application/json"}));
-    const link = document.createElement("a");
-    link.href = url; link.download = `cbir-${profile}-query-${latestResult.query_id}.json`;
-    link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-  });
+  function renderVladChart(values, note) {
+    const figure = $("#vlad-figure");
+    if (!figure || !Array.isArray(values) || !values.length) {
+      figure?.classList.add("is-hidden");
+      return;
+    }
+    figure.classList.remove("is-hidden");
+    if (note) $("#vlad-caption").textContent = note;
+    const max = Math.max(...values, .001);
+    $("#vlad-chart").innerHTML = values.map((value, index) => `<span class="vlad-cluster" style="height:${Math.max(value / max * 88, 3)}%" title="Cụm ${index}: ${Number(value).toFixed(4)}"></span>`).join("");
+  }
 
-  function renderHsvChart(values) {
+  function renderRegionalHsvChart(values) {
     const colors = ["#e95b45", "#f39a32", "#ded54f", "#68bd68", "#44bfc3", "#4d8de3", "#765ed6", "#cc5fb3"];
     const max = Math.max(...values, .001);
     $("#hsv-chart").innerHTML = values.map((value, index) => `<span class="hsv-bin" style="height:${Math.max(value / max * 88, 3)}%;--bin-color:${colors[index]}" title="Bin ${index}: ${Number(value).toFixed(4)}"></span>`).join("");
@@ -381,11 +397,20 @@
   }
 
   function renderStats(stats) {
+    const splitTotals = stats.split_totals || {};
+    const splits = Object.keys(splitTotals).filter((key) => Number(splitTotals[key] || 0) > 0);
+    const splitNote = splits.length ? `Trong CSDL: ${splits.join(" · ")}` : "Chưa nhập ảnh nào vào CSDL";
+    const datasetSplits = stats.dataset_splits || {};
+    const validationCount = Number(datasetSplits.validation ?? stats.validation ?? 0);
+    const validationNote = validationCount > 0
+      ? "Chọn cấu hình và trọng số" : "Bộ ảnh hiện hành không tách validation";
+    const testCount = Number(datasetSplits.test ?? stats.test ?? 0);
+    const testNote = testCount > 0 ? "Tách riêng, không nhập CSDL" : "Chưa có tập test độc lập";
     const entries = [
-      ["Tổng ảnh", stats.total_images, "Toàn bộ 3 split", false],
+      ["Tổng ảnh", stats.total_images, splitNote, false],
       ["Gallery hợp lệ", stats.valid_candidates, `${stats.approved_gallery} ảnh được duyệt; đã kiểm tra file và vector`, true],
-      ["Validation", stats.validation, "Dùng chọn trọng số", false],
-      ["Test", stats.test, "Đánh giá độc lập", false],
+      ["Validation", validationCount, validationNote, false],
+      ["Test", testCount, testNote, false],
       ["Lượt truy vấn", stats.searches, "Đã lưu trong SQLite", false],
     ];
     $("#stats-grid").innerHTML = entries.map(([label, value, note, featured]) => `<article class="stat-card${featured ? " featured" : ""}"><small>${label}</small><strong>${Number(value).toLocaleString("vi-VN")}</strong><span>${note}</span></article>`).join("");
@@ -397,7 +422,16 @@
 
     $("#gallery-issues").innerHTML = (stats.rejected_candidates || []).map((item) => `<div class="warning-item">Ảnh #${item.image_id} · ${escapeHtml(item.processed_path)}: ${escapeHtml(item.reason)}</div>`).join("");
     const maxSpecies = Math.max(...stats.by_species.map((item) => item.total), 1);
-    $("#species-chart").innerHTML = stats.by_species.map((item) => `<div class="species-bar" title="${escapeHtml(item.species)}: ${item.total} ảnh"><span>${item.total}</span><i style="height:${Math.max(item.total / maxSpecies * 255, 4)}px"></i><small>${escapeHtml(item.species)}</small></div>`).join("");
+    const approvedBySpecies = Object.fromEntries((stats.by_species || []).map((item) => [item.species, item.total]));
+    const galleryTotals = stats.dataset_gallery_by_species || {};
+    const chartSpecies = Object.keys(galleryTotals).length
+      ? Object.keys(galleryTotals).sort().map((name) => ({species: name, total: galleryTotals[name], approved: approvedBySpecies[name] || 0}))
+      : (stats.by_species || []).map((item) => ({species: item.species, total: item.total, approved: item.total}));
+    $("#species-chart").innerHTML = chartSpecies.map((item) => {
+      const outer = Math.max(item.total / maxSpecies * 255, 4);
+      const inner = item.total ? Math.max(item.approved / maxSpecies * 255, 0) : 0;
+      return `<div class="species-bar" title="${escapeHtml(item.species)}: ${item.total} ảnh gallery, ${item.approved} đã duyệt"><span>${item.total}</span><i style="height:${outer}px"><b style="height:${inner}px"></b></i><small>${escapeHtml(item.species)}</small></div>`;
+    }).join("") || `<p class="vector-meta">Chưa có ảnh gallery trong manifest nguồn.</p>`;
     $("#config-list").innerHTML = stats.configs.map((item) => {
       const type = String(item.feature_type).toLowerCase();
       return `<article class="config-item color-${type}"><span>${escapeHtml(item.feature_type)}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.preprocess_version)}</small></div><code>${Number(item.dimension).toLocaleString("vi-VN")}D</code></article>`;
@@ -410,7 +444,10 @@
   function renderHistory(rows) {
     $("#history-count").textContent = `${rows.length} bản ghi`;
     $("#history-list").innerHTML = rows.length ? rows.map((row) => {
-      const date = new Intl.DateTimeFormat("vi-VN", { dateStyle: "short", timeStyle: "short" }).format(new Date(row.created_at));
+      // SQLite CURRENT_TIMESTAMP is UTC but has no timezone suffix.
+      const timestamp = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(row.created_at)
+        ? `${row.created_at.replace(" ", "T")}Z` : row.created_at;
+      const date = new Intl.DateTimeFormat("vi-VN", { dateStyle: "short", timeStyle: "short" }).format(new Date(timestamp));
       return `<button class="history-item" type="button" data-query-id="${row.query_id}"><span class="history-icon">#${row.query_id}</span><span><strong>${row.candidate_count} ứng viên</strong><small>${date}</small></span><small>${formatNumber(row.duration_ms)} ms</small></button>`;
     }).join("") : `<div class="history-placeholder"><h2>Chưa có truy vấn</h2><p>Thực hiện một lần tìm kiếm để bắt đầu.</p></div>`;
     $$(".history-item", $("#history-list")).forEach((button) => button.addEventListener("click", () => loadHistoryDetail(button.dataset.queryId, button)));
@@ -470,6 +507,36 @@
     notice.classList.toggle("is-hidden", !message);
   }
 
+  function renderProcessingStatus(data) {
+    const count = (value) => Number(value || 0).toLocaleString("vi-VN");
+    $("#processing-cutout-count").textContent = count(data.cutouts);
+    $("#processing-source-count").textContent = `Trên ${count(data.total)} ảnh nguồn`;
+    $("#processing-imported-count").textContent = count(data.imported);
+    $("#processing-approved-count").textContent = count(data.approved_gallery);
+    $("#processing-output-folder").textContent = data.output_folder || "—";
+    $("#processing-database").textContent = data.database || "—";
+
+    const job = data.job;
+    const statuses = { running: "Đang chạy", completed: "Hoàn tất", failed: "Có lỗi", cancelled: "Đã dừng", interrupted: "Bị gián đoạn" };
+    const phases = { starting: "Đang chuẩn bị xử lý ảnh", remove_background: "Tách nền ảnh nguồn", extract_features: "Trích đặc trưng và lưu vào cơ sở dữ liệu" };
+    $("#processing-job-status").textContent = job ? (statuses[job.status] || job.status) : "Chưa có tác vụ";
+    $("#processing-job-status").dataset.state = job?.status || "idle";
+    $("#processing-job").textContent = job ? (phases[job.phase] || "Xử lý ảnh")
+      : "Chọn một thao tác ở trên để bắt đầu. Ảnh đã xử lý được giữ lại.";
+    const total = Math.max(Number(job?.total) || 0, 0);
+    const completed = Math.min(Math.max(Number(job?.completed) || 0, 0), total);
+    $("#processing-progress-block").classList.toggle("is-hidden", !job || (!total && job.status !== "running"));
+    const progress = $("#processing-progress");
+    progress.max = Math.max(total, 1);
+    if (total > 0) progress.value = completed;
+    else progress.removeAttribute("value");
+    $("#processing-progress-count").textContent = total ? `${count(completed)} / ${count(total)} ảnh` : "Đang chuẩn bị…";
+    $("#processing-progress-percent").textContent = total ? `${Math.round(completed / total * 100)}%` : "";
+    $("#processing-source").textContent = job?.source || "";
+    $("#processing-source").title = job?.source || "";
+    $("#processing-source").classList.toggle("is-hidden", !job?.source);
+  }
+
   async function refreshProcessing(force = false) {
     clearTimeout(processingPoll);
     try {
@@ -478,7 +545,7 @@
       if (!response.ok) throw new Error(data.error?.message || "Không đọc được trạng thái");
       processingBusy = data.busy;
       $(".processing-panel").classList.toggle("is-processing", data.busy);
-      $("#processing-summary").textContent = `${data.cutouts}/${data.total} ảnh tách nền · ${data.imported} ảnh đã lưu đặc trưng · ${data.approved_gallery} gallery được dùng. PNG: ${data.output_folder} · SQLite: ${data.database}`;
+      renderProcessingStatus(data);
       $$("[data-processing-action]").forEach((button) => {
         button.disabled = data.busy || (button.dataset.processingAction === "extract_features" && !data.cutouts);
       });
@@ -487,11 +554,6 @@
       $("#review-approve").disabled = data.busy;
       $("#review-reject").disabled = data.busy;
       const job = data.job;
-      const statusNames = { running: "Đang chạy", completed: "Đã chạy xong", failed: "Có lỗi", cancelled: "Đã dừng", interrupted: "Bị gián đoạn" };
-      const phases = { starting: "Chuẩn bị", remove_background: "Tách nền", extract_features: "Trích đặc trưng và lưu SQLite" };
-      $("#processing-progress").max = Math.max(job?.total || 0, 1);
-      $("#processing-progress").value = job?.completed || 0;
-      $("#processing-job").textContent = job ? `${statusNames[job.status] || job.status} · ${phases[job.phase] || job.phase} · ${job.completed}/${job.total}${job.source ? " · " + job.source : ""}` : "Chưa chạy tác vụ. Có thể chọn thử 5 ảnh trước.";
       renderProcessingNotice(job);
       const signature = JSON.stringify(data.items);
       if (force || signature !== lastReviewSignature) {
@@ -511,7 +573,9 @@
       if (data.busy) processingPoll = setTimeout(() => refreshProcessing(), 1800);
       if (job?.status === "completed") refreshDashboard(false);
     } catch (error) {
-      $("#processing-summary").textContent = error.message;
+      $("#processing-job").textContent = error.message;
+      $("#processing-job-status").textContent = "Không tải được trạng thái";
+      $("#processing-job-status").dataset.state = "failed";
       if (processingBusy) processingPoll = setTimeout(() => refreshProcessing(), 3000);
     }
   }

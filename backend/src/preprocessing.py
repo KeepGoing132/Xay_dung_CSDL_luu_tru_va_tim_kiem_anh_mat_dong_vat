@@ -17,7 +17,7 @@ def _open_or_raise(image_bytes: bytes) -> Image.Image:
     try:
         image = Image.open(BytesIO(image_bytes))
         image.load()
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
         raise invalid("INVALID_IMAGE", "Không thể giải mã ảnh", reason=str(exc)) from exc
     return ImageOps.exif_transpose(image)
 
@@ -64,9 +64,9 @@ def preprocess_image(
         minimum, maximum = image.convert("RGBA").getchannel("A").getextrema()
         if minimum == 255 or maximum == 0:
             raise invalid("BACKGROUND_REQUIRED", "Mask tách nền rỗng hoặc chưa có vùng nền trong suốt")
-    image = _to_rgb_on_white(image)
     resolved = _resolve_crop(image, crop)
     box = (resolved.x, resolved.y, resolved.x + resolved.size, resolved.y + resolved.size)
+    image = _to_rgb_on_white(image)
     cropped = image.crop(box)
     resized = cropped if cropped.size == (size, size) else cropped.resize((size, size), Image.Resampling.BILINEAR)
     rgb = np.asarray(resized, dtype=np.uint8)

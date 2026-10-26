@@ -40,8 +40,6 @@ def main() -> None:
     pairs: list[dict[str, str | int]] = []
     for left in range(len(rows)):
         for right in range(left + 1, len(rows)):
-            if rows[left]["species_name"] != rows[right]["species_name"]:
-                continue
             distance = (hashes[left] ^ hashes[right]).bit_count()
             if distance <= args.max_distance:
                 pairs.append(

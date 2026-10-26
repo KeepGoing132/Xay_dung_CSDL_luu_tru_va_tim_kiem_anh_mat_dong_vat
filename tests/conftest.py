@@ -2,12 +2,20 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 from PIL import Image
 import pytest
 
-from backend.src.config import AppConfig
+from backend.src.config import AppConfig, BUNDLE_NAME
+
+
+def pytest_configure(config):
+    if config.option.basetemp is None:
+        root = Path(__file__).resolve().parents[1] / "tmp" / "pytest-runs"
+        root.mkdir(parents=True, exist_ok=True)
+        config.option.basetemp = str(root / uuid4().hex)
 
 
 def image_bytes(array: np.ndarray, mode: str | None = None) -> bytes:
@@ -29,9 +37,10 @@ def app_config(tmp_path: Path) -> AppConfig:
     config = AppConfig(
         project_root=project,
         data_root=data,
-        db_path=data / "app.db",
+        db_path=data / "foreground4.db",
         migration_path=migration,
         artifacts_root=project / "artifacts",
+        bundle_name=BUNDLE_NAME,
     )
     config.ensure_runtime_dirs()
     return config

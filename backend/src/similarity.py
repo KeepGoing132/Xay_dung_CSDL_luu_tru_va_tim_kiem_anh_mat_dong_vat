@@ -32,12 +32,17 @@ def histogram_intersection(left: np.ndarray, right: np.ndarray) -> float:
 
 def cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
     if left.shape != right.shape:
-        raise invalid("CONFIG_MISMATCH", "Hai vector HOG khác số chiều")
+        raise invalid("CONFIG_MISMATCH", "Hai vector khác số chiều khi tính cosine")
     left_norm = float(np.linalg.norm(left))
     right_norm = float(np.linalg.norm(right))
     if left_norm <= 1e-12 or right_norm <= 1e-12:
         return 0.0
     return float(np.dot(left, right) / (left_norm * right_norm))
+
+
+def signed_cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
+    """Cosine chuẩn hóa (1+cos)/2 cho vector có dấu như VLAD, luôn nằm trong [0,1]."""
+    return float(np.clip((1.0 + cosine_similarity(left, right)) / 2.0, 0.0, 1.0))
 
 
 def _bounded(value: float) -> float:
@@ -58,6 +63,8 @@ def feature_distance(left: np.ndarray, right: np.ndarray, metric: dict) -> float
         return 1 - _bounded(histogram_intersection(left, right))
     if metric["metric"] == "cosine_exp":
         return 1 - _bounded(cosine_similarity(left, right))
+    if metric["metric"] == "cosine_signed_exp":
+        return 1 - _bounded(signed_cosine_similarity(left, right))
     if metric["metric"] == "standardized_l1_exp":
         scales = np.asarray(metric["coordinate_scales"], dtype=np.float64)
         if scales.shape != left.shape or not np.isfinite(scales).all() or (scales <= 0).any():
@@ -71,7 +78,7 @@ def calibrated_similarity(left, right, metric):
     scale = metric["scale"]
     if not math.isfinite(scale) or scale <= 0:
         raise invalid("CONFIG_MISMATCH", "Thang điểm hiệu chỉnh không hợp lệ")
-    if metric["metric"] == "cosine_exp" and min(np.linalg.norm(left), np.linalg.norm(right)) <= 1e-12:
+    if metric["metric"] in {"cosine_exp", "cosine_signed_exp"} and min(np.linalg.norm(left), np.linalg.norm(right)) <= 1e-12:
         return 0.0
     return _bounded(float(np.exp(-math.log(2) * distance / scale)))
 
@@ -89,37 +96,12 @@ def compare_features(query: FeatureBundle, candidate: FeatureBundle, weights: We
             candidate_preprocess=candidate.preprocess_version,
         )
     effective = normalize_weights(weights)
-    unknown = set(effective.extras) - set(query.extras)
-    if unknown:
-        raise invalid("INVALID_WEIGHTS", "Trọng số không thuộc cấu hình", features=sorted(unknown))
-    if "hsv" in query.similarities:
-        components = {name: calibrated_similarity(left, candidate.vectors[name], query.similarities[name])
-                      for name, left in query.vectors.items()}
-        total = _bounded(sum(score * effective.as_dict().get(name, 0.0) for name, score in components.items()))
-        return Scores(components["hsv"], components["hog"], components["lbp"], total,
-                      {name: value for name, value in components.items() if name in query.extras})
-    hsv_score = _bounded(histogram_intersection(query.hsv, candidate.hsv))
-    hog_score = _bounded(cosine_similarity(query.hog, candidate.hog))
-    lbp_score = _bounded(histogram_intersection(query.lbp, candidate.lbp))
-    extras = {}
-    for name, left in query.extras.items():
-        right = candidate.extras[name]
-        if left.shape != right.shape:
-            raise invalid("CONFIG_MISMATCH", "Vector khác số chiều", feature=name)
-        if not np.isfinite(left).all() or not np.isfinite(right).all():
-            raise invalid("INVALID_VECTOR", "Vector chứa giá trị không hữu hạn", feature=name)
-        metric = query.similarities[name]
-        if metric["metric"] == "intersection":
-            score = histogram_intersection(left, right)
-        elif metric["metric"] == "mean_l1_exp":
-            score = np.exp(-np.mean(np.abs(left - right)) / metric["scale"])
-        else:
-            raise invalid("CONFIG_MISMATCH", "Phép so sánh chưa được hỗ trợ", feature=name)
-        extras[name] = _bounded(float(score))
-    components = {"hsv": hsv_score, "hog": hog_score, "lbp": lbp_score, **extras}
-    values = effective.as_dict()
-    total = _bounded(sum(score * values.get(name, 0.0) for name, score in components.items()))
-    return Scores(hsv=hsv_score, hog=hog_score, lbp=lbp_score, total=total, extras=extras)
+    if query.vectors.keys() != query.similarities.keys():
+        raise invalid("CONFIG_MISMATCH", "Thiếu metric đóng băng cho bộ đặc trưng")
+    components = {name: calibrated_similarity(left, candidate.vectors[name], query.similarities[name])
+                  for name, left in query.vectors.items()}
+    total = _bounded(sum(score * effective.as_dict().get(name, 0) for name, score in components.items()))
+    return Scores.from_components(components, total)
 
 
 def rank_candidates(
@@ -151,7 +133,7 @@ def rank_scored_candidates(candidates, components: list[Scores], weights: Weight
         if set(effective.as_dict()) - set(component.as_dict()):
             raise invalid("INVALID_WEIGHTS", "Trọng số không thuộc cấu hình")
         total = _bounded(sum(component.contributions(effective).values()))
-        scored.append((candidate, Scores(component.hsv, component.hog, component.lbp, total, component.extras)))
+        scored.append((candidate, Scores.from_components(component.as_dict(), total)))
     scored.sort(key=lambda pair: (-pair[1].total, pair[0].image_id))
     items: list[SearchItem] = []
     seen: set[int] = set()

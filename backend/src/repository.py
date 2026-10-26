@@ -13,6 +13,8 @@ from PIL import Image
 
 from .config import AppConfig, feature_specs_for
 from .calibration import calibrated_specs
+from .codebook import with_codebook_specs
+from .pca import with_pca_specs, attach_projection
 from .errors import AppError, invalid
 from .models import (
     BundleConfig,
@@ -72,10 +74,7 @@ class Repository:
                 version = int(migration.name.split("_", 1)[0])
                 if connection.execute("SELECT 1 FROM schema_migrations WHERE version=?", (version,)).fetchone():
                     continue
-                rebuild_images = migration.name in {"003_image_sizes.sql", "004_extended_features.sql"}
                 try:
-                    if rebuild_images:
-                        connection.execute("PRAGMA foreign_keys = OFF")
                     connection.executescript("BEGIN IMMEDIATE;\n" + migration.read_text(encoding="utf-8"))
                     if connection.execute("PRAGMA foreign_key_check").fetchall():
                         raise invalid("PERSISTENCE_ERROR", "Migration tạo lỗi khóa ngoại", migration=migration.name)
@@ -84,9 +83,6 @@ class Repository:
                 except Exception:
                     connection.rollback()
                     raise
-                finally:
-                    if rebuild_images:
-                        connection.execute("PRAGMA foreign_keys = ON")
 
     def upsert_species(self, name: str | None, connection: sqlite3.Connection) -> int | None:
         if name is None or not name.strip():
@@ -155,12 +151,13 @@ class Repository:
             preprocess_version=str(row["preprocess_version"]),
         )
 
-    def ensure_baseline_bundle(self) -> BundleConfig:
+    def ensure_bundle(self) -> BundleConfig:
         specs = feature_specs_for(self.config.bundle_name, self.config.preprocess_version)
+        specs = with_codebook_specs(self.config, specs)
+        specs = with_pca_specs(self.config, specs)
         specs = calibrated_specs(self.config, specs)
         configs = {name: self.register_feature_config(spec) for name, spec in specs.items()}
-        return BundleConfig(name=self.config.bundle_name, hsv=configs["hsv"], hog=configs["hog"], lbp=configs["lbp"],
-                            extras={name: spec for name, spec in configs.items() if name not in {"hsv", "hog", "lbp"}})
+        return attach_projection(self.config, BundleConfig.from_configs(self.config.bundle_name, configs))
 
     def find_image_by_original_sha(self, checksum: str) -> int | None:
         with self.connect() as connection:
@@ -168,6 +165,28 @@ class Repository:
                 "SELECT image_id FROM images WHERE original_sha256 = ?", (checksum,)
             ).fetchone()
             return int(row["image_id"]) if row else None
+
+    def copy_gallery_vectors(self, source, features_by_image_id, bundle):
+        """Create a new profile from validated vectors, sharing immutable RGB/mask files."""
+        from .models import CropBox
+        copied = 0
+        for row in source.audit_image_records():
+            features = features_by_image_id.get(row['image_id'])
+            if features is None:
+                continue
+            if row['split'] != 'gallery' or not row['active'] or row['quality_status'] != 'approved':
+                raise ValueError('Only approved active gallery may seed a compressed profile')
+            if self.find_image_by_original_sha(row['original_sha256']) is not None:
+                continue
+            metadata = ImageMetadata(species_name=row['species_name'], original_path=row['original_path'],
+                processed_path=row['processed_path'], original_sha256=row['original_sha256'],
+                processed_sha256=row['processed_sha256'], source_url=row['source_url'], license_note=row['license_note'],
+                split='gallery', group_id=row['group_id'], crop=CropBox(**json.loads(row['crop_json'])),
+                preprocess_version=row['preprocess_version'], quality_status=row['quality_status'],
+                active=bool(row['active']), review_note=row['review_note'])
+            self.insert_image_with_features(metadata, features, bundle)
+            copied += 1
+        return copied
 
     def set_image_quality(self, checksum: str, status: str, review_note: str | None) -> None:
         if status not in {"pending", "approved", "rejected"}:
@@ -214,12 +233,28 @@ class Repository:
                                        [(path, url or None, note or None, checksum) for checksum, path, url, note in records])
 
     def retire_other_mask_versions(self, records: list[tuple[str, str]]) -> None:
+        """Về hưu mask cũ của cùng group_id, nhưng tha mọi hàng thuộc batch vừa nhập.
+
+        Một group_id có thể chứa nhiều ảnh hợp lệ (nhiều crop cùng trang nguồn hoặc cùng
+        phiên chụp), nên phải so theo cả tập checksum của group; so từng cặp
+        (group, checksum) sẽ khiến hai ảnh cùng group loại lẫn nhau.
+        """
+        current: dict[str, set[str]] = {}
+        for group, checksum in records:
+            current.setdefault(group, set()).add(checksum)
+        if not current:
+            return
         with self.connect() as connection:
             with connection:
-                connection.executemany(
-                    "UPDATE images SET active=0, quality_status='rejected', review_note='Superseded mask; immutable input and vectors retained for history' "
-                    "WHERE group_id=? AND original_sha256!=? AND preprocess_version=? AND active=1",
-                    [(group, checksum, self.config.preprocess_version) for group, checksum in records])
+                for group, checksums in current.items():
+                    placeholders = ",".join("?" for _ in checksums)
+                    connection.execute(
+                        "UPDATE images SET active=0, quality_status='rejected', "
+                        "review_note='Superseded mask; immutable input and vectors retained for history' "
+                        f"WHERE group_id=? AND original_sha256 NOT IN ({placeholders}) "
+                        "AND preprocess_version=? AND active=1",
+                        (group, *sorted(checksums), self.config.preprocess_version),
+                    )
 
     def audit_image_records(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -264,7 +299,8 @@ class Repository:
                 expected=config.dimension,
                 actual=int(array.size),
             )
-        if not np.isfinite(array).all() or (array < -1e-12).any():
+        signed = bool(config.parameters.get("signed_values"))
+        if not np.isfinite(array).all() or (not signed and (array < -1e-12).any()):
             raise invalid("INVALID_VECTOR", "Vector chứa NaN, Infinity hoặc giá trị âm")
         normalization = config.parameters["normalization"]
         if normalization.startswith("L1") and not np.isclose(array.sum(), 1.0, atol=1e-6, rtol=0):
@@ -402,10 +438,10 @@ class Repository:
                 continue
             candidates.append(Candidate(
                 image_id=image_id, processed_path=processed_path, species_name=row["species_name"],
-                features=FeatureBundle(
-                    hsv=vectors["hsv"], hog=vectors["hog"], lbp=vectors["lbp"], config_ids=bundle.config_ids,
+                features=FeatureBundle.from_vectors(
+                    vectors,
+                    config_ids=bundle.config_ids,
                     preprocess_version=bundle.preprocess_version,
-                    extras={name: vectors[name] for name in bundle.extras},
                     similarities={name: spec.parameters["similarity"] for name, spec in bundle.configs.items() if "similarity" in spec.parameters},
                     config_signature=bundle.signature,
                 )))
@@ -468,12 +504,12 @@ class Repository:
             "preprocess_version": bundle.preprocess_version,
             "weights": weights.as_dict(),
             "k": 5,
-            "algorithm_version": "calibrated-cbir-v1" if "similarity" in bundle.hsv.parameters else "weighted-cbir-v2",
+            "algorithm_version": "calibrated-cbir-v1",
             "config_signature": bundle.signature,
             "parameters": {name: spec.parameters for name, spec in bundle.configs.items()},
             "dimensions": {name: spec.dimension for name, spec in bundle.configs.items()},
             "gallery_signature": gallery_signature,
-            "library_versions": {name: version(name) for name in ("numpy", "scikit-image", "pillow")},
+            "library_versions": {name: version(name) for name in ("numpy", "scipy", "scikit-image", "pillow")},
         }
         with self.connect() as connection:
             try:
@@ -497,19 +533,16 @@ class Repository:
                 connection.executemany(
                     """
                     INSERT INTO search_results(
-                        query_id, rank, image_id, hsv_score, hog_score, lbp_score, total_score, extra_scores_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        query_id, rank, image_id, total_score, scores_json
+                    ) VALUES (?, ?, ?, ?, ?)
                     """,
                     [
                         (
                             query_id,
                             item.rank,
                             item.image_id,
-                            item.scores.hsv,
-                            item.scores.hog,
-                            item.scores.lbp,
                             item.scores.total,
-                            _canonical_json(item.scores.extras),
+                            _canonical_json(item.scores.as_dict()),
                         )
                         for item in items
                     ],
@@ -530,7 +563,8 @@ class Repository:
                     COUNT(*) AS total,
                     SUM(CASE WHEN split='gallery' AND active=1 AND quality_status='approved' THEN 1 ELSE 0 END) AS gallery,
                     SUM(CASE WHEN split='validation' THEN 1 ELSE 0 END) AS validation,
-                    SUM(CASE WHEN split='test' THEN 1 ELSE 0 END) AS test
+                    SUM(CASE WHEN split='test' THEN 1 ELSE 0 END) AS test,
+                    SUM(CASE WHEN split='gallery' THEN 1 ELSE 0 END) AS gallery_total
                 FROM images
                 """
             ).fetchone()
@@ -551,6 +585,9 @@ class Repository:
             "approved_gallery": int(totals["gallery"] or 0),
             "validation": int(totals["validation"] or 0),
             "test": int(totals["test"] or 0),
+            "split_totals": {"gallery": int(totals["gallery_total"] or 0),
+                             "validation": int(totals["validation"] or 0),
+                             "test": int(totals["test"] or 0)},
             "searches": int(searches["total"] or 0),
             "by_species": [dict(row) for row in by_species],
             "configs": [dict(row) for row in configs],
@@ -583,10 +620,12 @@ class Repository:
             rows = connection.execute(
                 """
                 SELECT r.rank, r.image_id, i.processed_path, s.name AS species_name,
-                       r.hsv_score, r.hog_score, r.lbp_score, r.total_score, r.extra_scores_json
+                       r.total_score, r.scores_json,
+                       q.search_config_json
                 FROM search_results r
                 JOIN images i ON i.image_id=r.image_id
                 LEFT JOIN species s ON s.species_id=i.species_id
+                JOIN search_queries q ON q.query_id=r.query_id
                 WHERE r.query_id=? ORDER BY r.rank
                 """,
                 (query_id,),
@@ -594,7 +633,9 @@ class Repository:
         items = []
         for row in rows:
             item = dict(row)
-            item["scores"] = {"hsv": item["hsv_score"], "hog": item["hog_score"], "lbp": item["lbp_score"],
-                              **json.loads(item.pop("extra_scores_json")), "total": item["total_score"]}
+            scores = json.loads(item.pop("scores_json"))
+            config_json = item.pop("search_config_json", None)
+            item["search_config"] = json.loads(config_json) if config_json else None
+            item["scores"] = {**scores, "total": item["total_score"]}
             items.append(item)
         return items

@@ -25,7 +25,7 @@ class SearchService:
         return (perf_counter() - start) * 1000.0
 
     def load_gallery(self, bundle=None):
-        bundle = bundle or self.repository.ensure_baseline_bundle()
+        bundle = bundle or self.repository.ensure_bundle()
         fingerprint = self.repository.gallery_fingerprint(bundle)
         cached = self._candidate_cache
         if cached is not None and cached[0] == fingerprint:
@@ -39,7 +39,6 @@ class SearchService:
         presets = [
             {"label": "Trọng số khởi đầu", "weights": default_weights_for(bundle.name)},
             {"label": "Các nhóm bằng nhau", "weights": {key: 1 / len(keys) for key in keys}},
-            *({"label": f"Chỉ {FEATURE_LABELS[key][0]}", "weights": {name: float(name == key) for name in keys}} for key in keys),
         ]
         path = self.config.result_directory("evaluation") / "selected_weights.json"
         if not path.exists():
@@ -50,7 +49,7 @@ class SearchService:
                 raise ValueError("Selected weights must be a JSON object")
             fingerprint = self.repository.gallery_fingerprint(bundle)
             signature = {"bundle_name": bundle.name, "config_ids": bundle.config_ids,
-                         "manifest_sha256": sha256(self.config.default_manifest_path.read_bytes()).hexdigest(),
+                         "manifest_sha256": sha256(self.config.source_manifest_path.read_bytes()).hexdigest(),
                          "gallery_fingerprint_sha256": sha256(repr(fingerprint).encode()).hexdigest()}
             if selected.get("signature") != signature:
                 return presets, "Trọng số validation đã cũ; cần đánh giá lại trên dữ liệu hiện tại."
@@ -63,17 +62,26 @@ class SearchService:
             return presets, f"Không đọc được bộ trọng số validation: {exc}"
 
     def search(self, request: SearchRequest) -> SearchResponse:
-        if request.bundle_name != self.config.bundle_name:
+        if request.bundle_name is not None and request.bundle_name != self.config.bundle_name:
             raise invalid("CONFIG_MISMATCH", "Bundle không được hỗ trợ", bundle_name=request.bundle_name)
         timings: dict[str, float] = {}
         start = perf_counter()
-        effective_weights = normalize_weights(request.weights)
+        effective_weights = normalize_weights(request.weights if request.weights is not None else
+            Weights.from_dict(default_weights_for(self.config.bundle_name)))
+        payload, crop = request.image_bytes, request.crop
+        bundle = self.repository.ensure_bundle()
+        from .processing_service import DatasetProcessingService
+        if not hasattr(self, "_query_processing"):
+            self._query_processing = DatasetProcessingService(self.config)
+        payload = self._query_processing.query_cutout(payload, crop)
+        crop = None
+        timings["segmentation_ms"] = self._elapsed_ms(start)
+        start = perf_counter()
         processed = preprocess_image(
-            request.image_bytes, request.crop, preprocess_version=self.config.preprocess_version
+            payload, crop, preprocess_version=self.config.preprocess_version
         )
         timings["preprocess_ms"] = self._elapsed_ms(start)
 
-        bundle = self.repository.ensure_baseline_bundle()
         start = perf_counter()
         query_features = extract_features(processed, bundle)
         timings["extract_ms"] = self._elapsed_ms(start)

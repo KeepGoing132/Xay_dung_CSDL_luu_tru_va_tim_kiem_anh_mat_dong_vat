@@ -13,6 +13,8 @@ from backend.src.repository import Repository
 
 
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    if not rows:
+        raise SystemExit("Không có dữ liệu để xuất; hãy nhập vector trước (scripts/prepare_dataset.py)")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))

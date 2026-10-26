@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -20,10 +21,12 @@ from starlette.routing import Route
 from starlette.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
-from .src.config import AppConfig, NATIVE512_BUNDLE_NAME, BACKGROUND512_BUNDLE_NAME, PROFILE_SETTINGS, FEATURE_LABELS, default_weights_for
+from .src.config import AppConfig, OFFICIAL_BUNDLE_NAME, feature_labels_for, default_weights_for, feature_specs_for
 from .src.errors import AppError
-from .src.features import extract_hog, lbp_code_image
-from .src.refined_features import spatial_weights
+from .src.features import extract_hog
+from .src.rootsift import cluster_weights
+from .src.spatial_features import spatial_weights
+from .src.calibration_preparation import descriptor_bundle
 from .src.models import CropBox, SearchRequest, SearchResponse, Weights
 from .src.repository import Repository
 from .src.search_service import SearchService
@@ -38,11 +41,10 @@ templates = Jinja2Templates(directory=FRONTEND_ROOT / "templates")
 
 @lru_cache(maxsize=1)
 def services() -> tuple[AppConfig, Repository, SearchService]:
-    config = AppConfig.default()
+    config = AppConfig.default(profile=OFFICIAL_BUNDLE_NAME)
     config.ensure_runtime_dirs()
     repository = Repository(config)
     repository.create_schema()
-    repository.ensure_baseline_bundle()
     return config, repository, SearchService(config, repository)
 
 
@@ -52,7 +54,6 @@ def services_for_profile(profile: str):
     config.ensure_runtime_dirs()
     repository = Repository(config)
     repository.create_schema()
-    repository.ensure_baseline_bundle()
     return config, repository, SearchService(config, repository)
 
 
@@ -60,14 +61,14 @@ def request_services(request: Request):
     profile = request.query_params.get("profile")
     if profile is None:
         return services()
-    if profile not in PROFILE_SETTINGS:
-        raise AppError("CONFIG_MISMATCH", "Cấu hình tìm kiếm không hợp lệ")
+    if profile != OFFICIAL_BUNDLE_NAME:
+        raise AppError("CONFIG_MISMATCH", f"Ứng dụng dùng cấu hình chính thức {OFFICIAL_BUNDLE_NAME} với 4 bộ mô tả")
     return services_for_profile(profile)
 
 
 @lru_cache(maxsize=1)
 def processing_jobs():
-    return ProcessingJobs(DatasetProcessingService(AppConfig.default(profile=NATIVE512_BUNDLE_NAME)))
+    return ProcessingJobs(DatasetProcessingService(AppConfig.default(profile=OFFICIAL_BUNDLE_NAME)))
 
 
 def image_data_url(image: Image.Image | np.ndarray) -> str:
@@ -102,7 +103,7 @@ def result_image(config: AppConfig, original_path: str | None, processed_path: s
 
 def serialize_search(response: SearchResponse, config: AppConfig, repository: Repository) -> dict[str, Any]:
     weights = response.effective_weights
-    bundle = repository.ensure_baseline_bundle()
+    bundle = repository.ensure_bundle()
     hog_vector, hog_image = extract_hog(response.processed_query.rgb, visualize=True, parameters=bundle.hog.parameters)
     del hog_vector
     hog_limit = float(np.percentile(hog_image, 99))
@@ -110,10 +111,13 @@ def serialize_search(response: SearchResponse, config: AppConfig, repository: Re
         hog_image,
         in_range=(0, hog_limit if hog_limit > 0 else 1.0),
     )
-    lbp_codes = lbp_code_image(response.processed_query.rgb, bundle.lbp.parameters)
-    lbp_preview = lbp_codes / max(float(lbp_codes.max()), 1.0)
-    hsv_bins = response.query_features.hsv.reshape(8, 4, 4).sum(axis=(1, 2))
-    prior = bundle.hsv.parameters.get("spatial_prior")
+    vlad_clusters = None
+    if "rootsift_vlad" in response.query_features.vectors:
+        spec = bundle.configs["rootsift_vlad"]
+        vlad_clusters = cluster_weights(response.query_features.vectors["rootsift_vlad"],
+                                        int(spec.parameters["vlad"]["clusters"])).tolist()
+    first_config = bundle.configs[next(iter(bundle.configs))]
+    prior = first_config.parameters.get("spatial_prior")
 
     originals = repository.original_paths([item.image_id for item in response.items])
     items = []
@@ -142,54 +146,86 @@ def serialize_search(response: SearchResponse, config: AppConfig, repository: Re
         "weights": weights.as_dict(),
         "timings": {**response.timings, "processing_ms": processing_ms},
         "warnings": list(response.warnings),
-        "feature_labels": {key: FEATURE_LABELS[key][0] for key in response.query_features.vectors},
+        "feature_labels": {key: feature_labels_for(config.bundle_name)[key][0] for key in response.query_features.vectors},
         "query": {
             "rgb": image_data_url(response.processed_query.rgb),
             "hog": image_data_url(hog_preview),
-            "lbp": image_data_url(lbp_preview),
-            "hsv_bins": hsv_bins.tolist(),
+            "spatial_hsv_bins": response.query_features.vectors["spatial_hsv"].reshape(4, 8, 4, 4).sum(axis=(0, 2, 3)).tolist(),
+            "rootsift_vlad_clusters": vlad_clusters,
             "dimensions": {name: int(vector.size) for name, vector in response.query_features.vectors.items()},
             "extra_vectors": {name: vector.tolist() for name, vector in response.query_features.extras.items()},
             "spatial_prior": image_data_url(spatial_weights(response.processed_query.rgb.shape, prior)) if prior else None,
             "preview_notes": {
-                "hog": "HOG hai mức ô 32/64, có trọng số vùng" if prior else "HOG theo cấu hình tìm kiếm",
-                "lbp": "Minh họa R=1; vector kết hợp R=1, 2, 3" if prior else "LBP theo cấu hình tìm kiếm",
+                "hog": ("HOG hai mức ô 32/64, có trọng số vùng" +
+                        (f"; PCA còn {bundle.hog.dimension} chiều" if bundle.hog.parameters.get('pca') else "")) if prior else "HOG theo cấu hình tìm kiếm",
+                "rootsift_vlad": "RootSIFT lưới đều ba mức, gộp VLAD 32 cụm" if prior else "VLAD theo cấu hình tìm kiếm",
             },
         },
     }
 
 
+def dataset_manifest_stats(config: AppConfig) -> tuple[dict[str, int], dict[str, int]]:
+    """Số ảnh theo split và theo loài (gallery) đọc từ manifest nguồn.
+
+    Ảnh test không nhập CSDL nên không đếm được từ bảng images; phân bố gallery vẫn hiển thị được
+    ngay cả khi chưa ảnh nào được duyệt mask.
+    """
+    splits: dict[str, int] = {}
+    gallery_species: dict[str, int] = {}
+    try:
+        with config.source_manifest_path.open(encoding="utf-8-sig", newline="") as stream:
+            for row in csv.DictReader(stream):
+                splits[row["split"]] = splits.get(row["split"], 0) + 1
+                if row["split"] == "gallery":
+                    gallery_species[row["species_name"]] = gallery_species.get(row["species_name"], 0) + 1
+    except OSError:
+        return {}, {}
+    return splits, gallery_species
+
+
 def public_stats(repository: Repository, service: SearchService | None = None) -> dict[str, Any]:
     stats = repository.dashboard_stats()
     service = service or SearchService(repository.config, repository)
-    loaded, _, _ = service.load_gallery()
-    return {
-        **stats,
-        "valid_candidates": len(loaded.candidates),
-        "rejected_candidates": [item.__dict__ for item in loaded.rejected],
-        "gallery_ready": len(loaded.candidates) >= 5,
-        "acceptance_ready": len(loaded.candidates) >= 500,
-    }
+    try:
+        loaded, _, _ = service.load_gallery()
+    except AppError as exc:
+        if exc.code not in {"CONFIG_MISMATCH", "CONFIG_CONFLICT"}:
+            raise
+        splits, gallery_species = dataset_manifest_stats(repository.config)
+        return {**stats, "dataset_splits": splits, "dataset_gallery_by_species": gallery_species,
+                "valid_candidates": 0, "rejected_candidates": [], "gallery_ready": False,
+                "acceptance_ready": False, "calibration_ready": False, "setup_error": exc.message}
+    splits, gallery_species = dataset_manifest_stats(repository.config)
+    return {**stats, "dataset_splits": splits, "dataset_gallery_by_species": gallery_species,
+            "valid_candidates": len(loaded.candidates),
+            "rejected_candidates": [item.__dict__ for item in loaded.rejected],
+            "gallery_ready": len(loaded.candidates) >= 5, "acceptance_ready": len(loaded.candidates) >= 500,
+            "calibration_ready": True, "setup_error": None}
 
 
 async def homepage(request: Request) -> HTMLResponse:
     config, repository, service = request_services(request)
-    bundle = repository.ensure_baseline_bundle()
     stats = await run_in_threadpool(public_stats, repository, service)
     weights = default_weights_for(config.bundle_name)
-    weight_presets, preset_warning = await run_in_threadpool(service.weight_presets, bundle)
+    if stats["calibration_ready"]:
+        bundle = repository.ensure_bundle()
+        weight_presets, preset_warning = await run_in_threadpool(service.weight_presets, bundle)
+    else:
+        bundle = descriptor_bundle(config, feature_specs_for(config.bundle_name))
+        weight_presets = [{"label": "Trọng số khởi đầu", "weights": weights}]
+        preset_warning = stats["setup_error"]
     return templates.TemplateResponse(
         request,
         "index.html",
         {"stats": stats, "background_input": config.background_input,
-         "automatic_background": config.bundle_name == BACKGROUND512_BUNDLE_NAME,
+         "automatic_background": True,
          "bundle_name": config.bundle_name, "image_size": config.image_size,
          "hog_dimension": bundle.hog.dimension,
          "total_dimensions": sum(spec.dimension for spec in bundle.configs.values()),
-         "feature_info": [{"key": name, "label": FEATURE_LABELS[name][0], "description": FEATURE_LABELS[name][1],
+         "feature_info": [{"key": name, "label": feature_labels_for(config.bundle_name)[name][0], "description": feature_labels_for(config.bundle_name)[name][1],
                            "dimension": spec.dimension, "weight": weights[name]} for name, spec in bundle.configs.items()],
          "weight_presets": weight_presets, "preset_warning": preset_warning,
-         "refined": "spatial_prior" in bundle.hsv.parameters,
+         "spatial_weighted": True,
          "asset_versions": {
              name: hashlib.sha256((FRONTEND_ROOT / "static" / name).read_bytes()).hexdigest()[:12]
              for name in ("app.css", "motion.css", "motion.js", "app.js")
@@ -240,18 +276,8 @@ async def search_api(request: Request) -> JSONResponse:
             crop = CropBox(x=x, y=y, size=size)
 
         segmentation_ms = 0.0
-        if config.bundle_name == BACKGROUND512_BUNDLE_NAME:
-            try:
-                preprocess_image(image_bytes, crop, preprocess_version=config.preprocess_version)
-            except AppError as exc:
-                if exc.code != "BACKGROUND_REQUIRED":
-                    raise
-                segmentation_started = perf_counter()
-                image_bytes = await run_in_threadpool(processing_jobs().service.query_cutout, image_bytes, crop)
-                segmentation_ms = (perf_counter() - segmentation_started) * 1000
-                crop = None
         defaults = default_weights_for(config.bundle_name)
-        unknown_weights = set(FEATURE_LABELS) - set(defaults)
+        unknown_weights = set(form) - set(defaults) - {"image", "use_crop", "crop_x", "crop_y", "crop_size"}
         if any(name in form for name in unknown_weights):
             raise AppError("INVALID_WEIGHTS", "Trọng số không thuộc cấu hình đã chọn")
         response = await run_in_threadpool(
@@ -265,7 +291,7 @@ async def search_api(request: Request) -> JSONResponse:
         )
         preview_started = perf_counter()
         result = await run_in_threadpool(serialize_search, response, config, repository)
-        result["timings"].update(segmentation_ms=segmentation_ms,
+        result["timings"].update(segmentation_ms=response.timings.get("segmentation_ms", segmentation_ms),
                                  preview_ms=(perf_counter() - preview_started) * 1000,
                                  request_ms=(perf_counter() - request_started) * 1000)
         return JSONResponse(result)
@@ -304,6 +330,7 @@ async def history_api(request: Request) -> JSONResponse:
 
 
 async def processing_api(request: Request) -> JSONResponse:
+    request_services(request)
     jobs = processing_jobs()
     if request.method == "GET":
         catalog = await run_in_threadpool(jobs.service.catalog,
@@ -319,10 +346,12 @@ async def processing_api(request: Request) -> JSONResponse:
 
 
 async def processing_cancel_api(request: Request) -> JSONResponse:
+    request_services(request)
     return JSONResponse({"job": processing_jobs().cancel()})
 
 
 async def processing_review_api(request: Request) -> JSONResponse:
+    request_services(request)
     jobs = processing_jobs()
     if jobs.busy:
         raise AppError("PROCESSING_BUSY", "Hãy đợi tác vụ hoàn tất trước khi duyệt ảnh")
@@ -334,6 +363,7 @@ async def processing_review_api(request: Request) -> JSONResponse:
 
 
 async def processing_preview_api(request: Request):
+    request_services(request)
     path = await run_in_threadpool(processing_jobs().service.preview_path,
                                   request.path_params["source_id"], request.path_params["kind"])
     return FileResponse(path, media_type="image/png")

@@ -7,29 +7,32 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import sqlite3
-import shutil
 from contextlib import closing
 
-from .config import BACKGROUND_BUNDLE_NAME, BACKGROUND512_BUNDLE_NAME
+from .config import PROFILE_SETTINGS
 from .cutouts import validate_cutout
-from .ingestion import IngestionService
+from .ingestion import IngestionService, extract_import_features
 from .repository import Repository
 
-def build_manifest(config, source_manifest, cutouts_dir, allow_partial=False, reviewed=False, limit=None):
+def build_manifest(config, source_manifest, cutouts_dir, allow_partial=False, reviewed=False, limit=None, *, source_splits=None):
     with source_manifest.open(encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         fields = reader.fieldnames
         sources = list(reader)
+    if source_splits is not None:
+        sources = [row for row in sources if row["split"] in source_splits]
     if limit is not None:
         if type(limit) is not int or limit < 1 or limit > len(sources):
             raise ValueError("Invalid import limit")
         sources = sorted(sources, key=lambda row: config.resolve_data_path(row["relative_path"]))[:limit]
     rows, missing = [], []
     for source in sources:
-        original_relative = Path(source["relative_path"])
-        if original_relative.parts[0] != "original":
-            raise ValueError(f"Source manifest must refer to original/ images: {original_relative}")
-        relative = Path(*original_relative.parts[1:])
+        if source["split"] == "unassigned":
+            continue
+        original_path = config.resolve_data_path(source["relative_path"])
+        if not original_path.is_relative_to(config.source_root.resolve()):
+            raise ValueError(f"Source outside dataset: {source['relative_path']}")
+        relative = original_path.relative_to(config.source_root.resolve())
         cutout = cutouts_dir / relative.parent / (relative.name + ".png")
         if not cutout.is_file():
             missing.append(source["relative_path"])
@@ -48,23 +51,23 @@ def build_manifest(config, source_manifest, cutouts_dir, allow_partial=False, re
         )
         rows.append(row)
     if missing and not allow_partial:
-        raise ValueError(f"Missing {len(missing)}/{len(sources)} cutouts; first: {missing[0]}. Run the model on data/original first.")
+        raise ValueError(f"Missing {len(missing)}/{len(sources)} cutouts; first: {missing[0]}. Run scripts/prepare_dataset.py first.")
     if not rows:
         raise ValueError("No matching cutouts found")
     return fields, rows, missing
 
 
 def run_import(config, source_manifest, cutouts_dir, manifest, *, allow_partial=False, reviewed=False, progress=None, limit=None):
-    if config.bundle_name not in {BACKGROUND_BUNDLE_NAME, BACKGROUND512_BUNDLE_NAME}:
+    if config.bundle_name not in PROFILE_SETTINGS:
         raise ValueError("Background import requires a background-white profile")
-    if config.db_path.resolve() in {(config.data_root / name).resolve() for name in ("app.db", "native512.db", "expanded512.db", "refined512.db")}:
-        raise ValueError("Cannot overwrite the baseline database")
     if manifest.resolve() == source_manifest.resolve():
         raise ValueError("Cannot overwrite the source manifest")
     config.relative_to_data(cutouts_dir)
     config.relative_to_data(manifest)
     config.relative_to_data(config.db_path)
-    fields, rows, missing = build_manifest(config, source_manifest, cutouts_dir, allow_partial, reviewed, limit)
+    # Chỉ gallery vào CSDL: ảnh test là query đánh giá, không lưu đặc trưng.
+    fields, rows, missing = build_manifest(config, source_manifest, cutouts_dir, allow_partial, reviewed, limit,
+                                           source_splits={"gallery"})
     previous_rows = []
     if manifest.exists():
         with manifest.open(encoding="utf-8-sig", newline="") as stream:
@@ -78,29 +81,18 @@ def run_import(config, source_manifest, cutouts_dir, manifest, *, allow_partial=
                 source.backup(target)
     repository = Repository(config)
     repository.create_schema()
-    if config.bundle_name == BACKGROUND512_BUNDLE_NAME:
-        # Store immutable mask inputs so later manual corrections cannot alter history.
-        for row in rows:
-            cutout = config.resolve_data_path(row["relative_path"])
-            checksum = sha256(cutout.read_bytes()).hexdigest()
-            snapshot = config.data_root / "background_removed" / "versions" / row["split"] / row["species_name"] / (cutout.name + "." + checksum[:16] + ".png")
-            config.relative_to_data(snapshot)
-            snapshot.parent.mkdir(parents=True, exist_ok=True)
-            if snapshot.exists():
-                if sha256(snapshot.read_bytes()).hexdigest() != checksum:
-                    raise ValueError(f"Mask snapshot conflict: {config.relative_to_data(snapshot)}")
-            else:
-                shutil.copy2(cutout, snapshot)
-            row["relative_path"] = config.relative_to_data(snapshot)
+    # Ảnh nhập trỏ thẳng vào mask đang dùng ở background_removed/{profile}; checksum của mask
+    # được lưu trong bảng images nên sửa mask về sau bị phát hiện, không cần bản sao đóng băng.
     existing = {}
     for row in rows:
         checksum = sha256(config.resolve_data_path(row["relative_path"]).read_bytes()).hexdigest()
         existing[checksum] = row
     manifest.parent.mkdir(parents=True, exist_ok=True)
-    summary = IngestionService(config, repository).import_rows(rows, progress=progress)
+    prepared = extract_import_features(config, repository, rows)
+    summary = IngestionService(config, repository, features_by_sha=prepared).import_rows(rows, progress=progress)
     if not summary.failed:
         repository.update_image_attributions([(checksum, row["relative_path"], row["source_url"], row["license_note"]) for checksum, row in existing.items()])
-        if config.bundle_name == BACKGROUND512_BUNDLE_NAME:
+        if config.bundle_name in PROFILE_SETTINGS:
             repository.retire_other_mask_versions([(row["group_id"], checksum) for checksum, row in existing.items()])
     if reviewed and not summary.failed:
         for checksum, row in existing.items():
@@ -114,16 +106,17 @@ def run_import(config, source_manifest, cutouts_dir, manifest, *, allow_partial=
                 row["quality_status"] = stored["quality_status"]
                 row["review_note"] = stored["review_note"] or ""
     if not summary.failed:
-        # A limited run must not discard other previously imported source groups.
-        merged = {row["group_id"]: row for row in previous_rows}
-        merged.update({row["group_id"]: row for row in rows})
+        # A limited run must not discard other previously imported images. Khoá theo
+        # (group_id, relative_path) vì một group có thể chứa nhiều ảnh hợp lệ.
+        merged = {(row["group_id"], row["relative_path"]): row for row in previous_rows}
+        merged.update({(row["group_id"], row["relative_path"]): row for row in rows})
         temporary = manifest.with_suffix(".tmp")
         with temporary.open("w", encoding="utf-8-sig", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=fields)
             writer.writeheader()
             writer.writerows(merged.values())
         temporary.replace(manifest)
-    bundle = repository.ensure_baseline_bundle()
+    bundle = repository.ensure_bundle()
     loaded = repository.load_candidates(bundle)
     stats = repository.dataset_integrity()
     result = {

@@ -23,17 +23,6 @@ from backend.src.preprocessing import preprocess_image
 from backend.src.repository import Repository
 from backend.src.similarity import normalize_weights, compare_features, rank_scored_candidates
 
-BASELINE_RUNS = {
-    "A_HSV": Weights(1, 0, 0), "B_HOG": Weights(0, 1, 0), "C_LBP": Weights(0, 0, 1),
-    "D_EQUAL": Weights(1, 1, 1),
-}
-TUNING_RUNS = {
-    "T_COLOR": Weights(.5, .25, .25), "T_SHAPE": Weights(.25, .5, .25),
-    "T_TEXTURE": Weights(.25, .25, .5), "T_COLOR_SHAPE": Weights(.45, .45, .1),
-    "T_SHAPE_TEXTURE": Weights(.1, .45, .45),
-}
-
-
 def percentile95(values):
     return float(np.percentile(values, 95)) if values else ""
 
@@ -54,10 +43,70 @@ def validate_query_split(rows, records):
             raise ValueError(f"Query has not been approved: {row['relative_path']}")
 
 
-def evaluate_runs(rows, runs, config, bundle, candidates, gallery_pixel_hashes=(), gallery_byte_hashes=()):
+def parse_weight_overrides(spec, weights):
+    """Phân tích 'TÊN:khóa=giá_trị,khóa=giá_trị;...' thành các bộ trọng số thử nghiệm.
+
+    Mỗi biến thể bắt đầu từ trọng số mặc định rồi ghi đè các khóa được nêu; giá trị
+    được chuẩn hoá lúc xếp hạng như mọi run khác. Dùng để quét độ nhạy (ví dụ hạ dần
+    trọng số một nhóm) mà không đổi trọng số mặc định của ứng dụng.
+    """
+    variants = {}
+    for chunk in spec.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise ValueError(f"Biến thể trọng số thiếu dấu ':': {chunk}")
+        name, assignments = chunk.split(":", 1)
+        name = name.strip().upper()
+        if not name or name in variants:
+            raise ValueError(f"Tên biến thể trống hoặc trùng: {name}")
+        values = dict(weights)
+        for assignment in assignments.split(","):
+            assignment = assignment.strip()
+            if "=" not in assignment:
+                raise ValueError(f"Biến thể trọng số thiếu dấu '=': {assignment}")
+            key, value = assignment.split("=", 1)
+            key = key.strip()
+            if key not in values:
+                raise ValueError(f"Khóa trọng số không thuộc cấu hình: {key}")
+            try:
+                values[key] = float(value)
+            except ValueError as exc:
+                raise ValueError(f"Trọng số không phải số: {value}") from exc
+        variants[name] = Weights.from_dict(values)
+    if not variants:
+        raise ValueError("Không có biến thể trọng số nào được khai báo")
+    return variants
+
+
+def load_query_originals(config, manifest_path):
+    """Tra nguồn ảnh truy vấn theo đường dẫn ảnh hoặc đường dẫn mask của nó."""
+    from backend.src.processing_service import DatasetProcessingService
+    processing = DatasetProcessingService(config)
+    originals = {}
+    with manifest_path.open(encoding="utf-8-sig", newline="") as stream:
+        for source in csv.DictReader(stream):
+            originals[source["relative_path"]] = source
+            try:
+                originals[config.relative_to_data(processing.cutout_path(source))] = source
+            except ValueError:
+                # Bộ test độc lập nằm ngoài cây nguồn dataset512-left nên không có
+                # đường dẫn mask tương ứng; tra trực tiếp bằng relative_path.
+                continue
+    return originals
+
+
+def evaluate_runs(rows, runs, config, bundle, candidates, gallery_pixel_hashes=(), gallery_byte_hashes=(),
+                  originals=None):
     per_query_rows = []
     known_species = {candidate.species_name.casefold() for candidate in candidates if candidate.species_name}
-    accumulators = {key: {"p5": [], "latencies": [], "failed": 0, "by_label": {}, "known_total": 0} for key in runs}
+    accumulators = {key: {"p5": [], "latencies": [], "failed": 0, "by_label": {}, "known_total": 0,
+                          "top1": [], "top5": []} for key in runs}
+    if originals is None:
+        originals = load_query_originals(config, config.source_manifest_path)
+    from backend.src.processing_service import DatasetProcessingService
+    processing = DatasetProcessingService(config)
     for index, row in enumerate(rows, 1):
         known = row["species_name"].casefold() in known_species
         for values in accumulators.values():
@@ -65,12 +114,16 @@ def evaluate_runs(rows, runs, config, bundle, candidates, gallery_pixel_hashes=(
         base = {"query_key": row["relative_path"], "query_group_id": row["group_id"], "query_species": row["species_name"]}
         try:
             start = perf_counter()
-            payload = config.resolve_data_path(row["relative_path"]).read_bytes()
-            processed = preprocess_image(payload, IngestionService._crop_from_row(row), preprocess_version=config.preprocess_version)
+            query_row = originals[row["relative_path"]]
+            payload = config.resolve_data_path(query_row["relative_path"]).read_bytes()
+            crop = IngestionService._crop_from_row(query_row)
+            payload = processing.query_cutout(payload, crop)
+            crop = None
+            processed = preprocess_image(payload, crop, preprocess_version=config.preprocess_version)
             if processed.pixel_sha256 in gallery_pixel_hashes or sha256(payload).hexdigest() in gallery_byte_hashes:
                 raise ValueError(f"Query pixels/bytes overlap gallery: {row['relative_path']}")
             query_features = extract_features(processed, bundle)
-            components = [compare_features(query_features, candidate.features, Weights(1, 0, 0)) for candidate in candidates]
+            components = [compare_features(query_features, candidate.features, Weights()) for candidate in candidates]
             shared_ms = (perf_counter() - start) * 1000
         except Exception as exc:
             if "overlap gallery" in str(exc):
@@ -86,8 +139,11 @@ def evaluate_runs(rows, runs, config, bundle, candidates, gallery_pixel_hashes=(
             latency = shared_ms + (perf_counter() - start) * 1000
             accumulators[run_id]["latencies"].append(latency)
             matches = 0
+            first_hit = False
             for item in items:
                 same = bool(item.species_name and item.species_name.casefold() == row["species_name"].casefold()) if known else None
+                if item.rank == 1:
+                    first_hit = same is True
                 matches += int(same is True)
                 per_query_rows.append({"run_id": run_id, **base, "rank": item.rank, "image_id": item.image_id,
                                        "candidate_species": item.species_name, "scores_json": json.dumps(item.scores.as_dict(), sort_keys=True),
@@ -96,6 +152,8 @@ def evaluate_runs(rows, runs, config, bundle, candidates, gallery_pixel_hashes=(
             if known:
                 values = accumulators[run_id]
                 values["p5"].append(matches / 5)
+                values["top1"].append(int(first_hit))
+                values["top5"].append(int(matches > 0))
                 values["by_label"].setdefault(row["species_name"], []).append(matches / 5)
         if index % 10 == 0:
             print(f"Evaluated {index}/{len(rows)} queries", flush=True)
@@ -104,6 +162,8 @@ def evaluate_runs(rows, runs, config, bundle, candidates, gallery_pixel_hashes=(
         values = accumulators[run_id]
         metrics.append({"run_id": run_id, "n_queries": len(rows), "n_failed": values["failed"],
                         "n_known_queries": len(values["p5"]),
+                        "top1_accuracy": mean(values["top1"]) if values["top1"] else "",
+                        "top5_accuracy": mean(values["top5"]) if values["top5"] else "",
                         "mean_same_species_p5": mean(values["p5"]) if values["p5"] else "",
                         "mean_all_known_p5": sum(values["p5"]) / values["known_total"] if values["known_total"] else "",
                         "macro_label_p5": mean(mean(v) for v in values["by_label"].values()) if values["by_label"] else "",
@@ -127,22 +187,32 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=list(PROFILE_SETTINGS))
     parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--split", choices=["validation", "test"], default="validation")
+    parser.add_argument("--split", choices=["validation", "test"])
+    parser.add_argument("--use-selected-weights", action="store_true",
+                        help="Include weights selected by a previous full validation run")
+    parser.add_argument("--leave-one-out", action="store_true",
+                        help="Add ALL4_NO_<feature> runs measuring each group's marginal contribution")
+    parser.add_argument("--weight-overrides",
+                        help="Extra runs 'NAME:key=value,key=value;...' built from the default weights")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
         parser.error("limit must be positive")
     config = AppConfig.default(args.profile)
+    args.split = args.split or ('validation' if config.pca_components else 'test')
+    if args.use_selected_weights and args.split != "test":
+        parser.error("--use-selected-weights requires --split test")
     repository = Repository(config)
     repository.create_schema()
-    bundle = repository.ensure_baseline_bundle()
+    bundle = repository.ensure_bundle()
     load_start = perf_counter()
     loaded = repository.load_candidates(bundle)
     load_ms = (perf_counter() - load_start) * 1000
     if len(loaded.candidates) < 500:
         raise SystemExit(f"Evaluation requires at least 500 valid gallery images; got {len(loaded.candidates)}")
-    manifest = args.manifest or config.default_manifest_path
+    # Evaluation queries stay outside the database; both splits use the source manifest.
+    manifest = args.manifest or config.source_manifest_path
     with manifest.open(encoding="utf-8-sig", newline="") as stream:
         all_rows = list(csv.DictReader(stream))
     records = repository.audit_image_records()
@@ -161,16 +231,35 @@ def main():
     signature = {"bundle_name": bundle.name, "config_ids": bundle.config_ids,
                  "manifest_sha256": sha256(manifest.read_bytes()).hexdigest(),
                  "gallery_fingerprint_sha256": sha256(repr(repository.gallery_fingerprint(bundle)).encode()).hexdigest()}
-    runs = dict(BASELINE_RUNS)
-    if bundle.extras:
-        for key in bundle.extras:
-            runs[f"SINGLE_{key.upper()}"] = Weights.from_dict({key: 1})
-        runs["F_EQUAL_ALL"] = Weights.from_dict({key: 1 for key in bundle.configs})
-        runs["G_DEFAULT_ALL"] = Weights.from_dict(default_weights_for(bundle.name))
-        runs["H_SHAPE_SPATIAL_TEXTURE"] = Weights.from_dict({"hog": .6, "spatial_hsv": .2, "glcm": .2})
+    weights = default_weights_for(config.bundle_name)
+    runs = {"ALL4_DEFAULT": Weights.from_dict(weights),
+            "ALL4_EQUAL": Weights.from_dict({key: 1 for key in weights})}
+    # Run chẩn đoán: dùng để đọc đóng góp/độ nhạy, không tham gia chọn trọng số.
+    diagnostic = set()
+    # Mỗi bộ đặc trưng chạy một mình để thấy đóng góp riêng của nó trên cùng bộ query.
+    for key in weights:
+        runs[f"ONLY_{key.upper()}"] = Weights.from_dict({name: 1.0 if name == key else 0.0 for name in weights})
+    if args.leave_one_out:
+        # Bỏ hẳn một nhóm, giữ nguyên trọng số các nhóm còn lại; hiệu số với
+        # ALL4_DEFAULT là đóng góp biên của nhóm đó. Không đổi trọng số runtime.
+        for key in weights:
+            run_id = f"ALL4_NO_{key.upper()}"
+            runs[run_id] = Weights.from_dict(
+                {name: 0.0 if name == key else value for name, value in weights.items()})
+            diagnostic.add(run_id)
+    if args.weight_overrides:
+        # Quét độ nhạy trọng số, ví dụ "GABOR005:gabor=0.05;GABOR010:gabor=0.10".
+        variants = parse_weight_overrides(args.weight_overrides, weights)
+        for run_id, variant in variants.items():
+            if run_id in runs:
+                raise ValueError(f"Tên biến thể trọng số trùng run khác: {run_id}")
+            runs[run_id] = variant
+            diagnostic.add(run_id)
     if args.split == "validation":
-        runs.update(TUNING_RUNS)
-    else:
+        families = {"COLOR": {"spatial_hsv"}, "SHAPE": {"hog", "rootsift_vlad"}, "TEXTURE": {"gabor"}}
+        for name, family in families.items():
+            runs[f"ALL4_{name}"] = Weights.from_dict({key: value * (2 if key in family else 1) for key, value in weights.items()})
+    if args.use_selected_weights:
         if not selected_path.exists():
             raise ValueError("Run full validation first to select weights")
         selected = json.loads(selected_path.read_text(encoding="utf-8"))
@@ -178,12 +267,21 @@ def main():
             raise ValueError("Selected weights belong to another dataset/configuration; rerun validation")
         runs["E_SELECTED"] = Weights.from_dict(selected["weights"])
     gallery = [r for r in records if r["split"] == "gallery"]
+    originals = load_query_originals(config, manifest)
+    if manifest != config.source_manifest_path:
+        # Query của manifest riêng có thể trỏ tới mask ở bộ nguồn chính; tra thêm
+        # nguồn gốc để giữ nguyên hành vi cũ khi dùng --manifest.
+        for key, value in load_query_originals(config, config.source_manifest_path).items():
+            originals.setdefault(key, value)
     per_query, metrics = evaluate_runs(rows, runs, config, bundle, loaded.candidates,
-                                      {r["processed_sha256"] for r in gallery}, {r["original_sha256"] for r in gallery})
+                                      {r["processed_sha256"] for r in gallery}, {r["original_sha256"] for r in gallery},
+                                      originals)
     write_csv(output / f"per_query_results_{args.split}.csv", per_query)
     write_csv(output / f"metrics_{args.split}.csv", metrics)
     if args.split == "validation" and args.limit is None:
-        eligible = [r for r in metrics if r["mean_all_known_p5"] != "" and r["n_failed"] == 0]
+        # Run chẩn đoán (ALL4_NO_*, biến thể trọng số) không tham gia chọn trọng số để giữ nguyên quy tắc chọn.
+        eligible = [r for r in metrics if r["mean_all_known_p5"] != "" and r["n_failed"] == 0
+                    and r["run_id"] not in diagnostic]
         if not eligible:
             raise ValueError("No complete run with known-label queries; weights were not selected")
         best = sorted(eligible, key=lambda r: (-r["mean_all_known_p5"], r["run_id"]))[0]
@@ -198,9 +296,9 @@ def main():
                   "dimensions": {k: v.dimension for k, v in bundle.configs.items()},
                   "runs": {k: normalize_weights(v).as_dict() for k, v in runs.items()},
                   "platform": platform.platform(), "python": platform.python_version(),
-                  "libraries": {k: version(k) for k in ["numpy", "scikit-image", "pillow"]},
+                  "libraries": {k: version(k) for k in ["numpy", "scipy", "scikit-image", "pillow"]},
                   "gallery_load_ms": load_ms,
-                  "timing_note": "query read/preprocess/extract/all component scores/rank; shared component time attributed to each run; gallery load separate; no web, segmentation, previews or persistence",
+                  "timing_note": "query read/segmentation-or-verified-cache/preprocess/extract/rank; gallery load separate",
                   "note": "Same-label P@5 is not species probability or visual relevance. Human judgments are still required."}
     (output / f"experiment_{args.split}.json").write_text(json.dumps(experiment, indent=2), encoding="utf-8")
     pairs = sorted({(r["query_key"], r["image_id"]) for r in per_query if r["image_id"] != ""})

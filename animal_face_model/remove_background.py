@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from uuid import uuid4
 
 from PIL import Image, ImageOps
 
@@ -17,7 +18,7 @@ MODEL_DIR = Path(__file__).resolve().parent
 ROOT = MODEL_DIR.parent
 sys.path.insert(0, str(ROOT))
 from backend.src.cutouts import validate_cutout
-MODEL_SHA256 = "5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333"
+from backend.src.config import BACKGROUND_MODEL_SHA256 as MODEL_SHA256, OFFICIAL_MODEL_RUNTIME, OFFICIAL_REMBG_VERSION
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 
 
@@ -28,7 +29,7 @@ def display_path(path: Path) -> str:
         return path.name
 
 
-def create_session(threads: int):
+def create_session(threads: int, provider: str = "cpu"):
     model = MODEL_DIR / "birefnet-general-lite.onnx"
     if not model.is_file():
         raise FileNotFoundError(f"Local model missing: {model}")
@@ -38,6 +39,27 @@ def create_session(threads: int):
     os.environ["U2NET_HOME"] = str(MODEL_DIR)
     os.environ["OMP_NUM_THREADS"] = str(threads)
     os.environ.pop("MODEL_CHECKSUM_DISABLED", None)
+    if provider == "directml":
+        runtime = MODEL_DIR / "runtime-directml"
+        if not (runtime / "onnxruntime").is_dir():
+            raise FileNotFoundError("Install animal_face_model/requirements-directml.txt into animal_face_model/runtime-directml")
+        sys.path.insert(0, str(runtime))
+        import onnxruntime as ort
+        from rembg.sessions.birefnet_general_lite import BiRefNetSessionGeneralLite
+        if ort.__version__ != OFFICIAL_MODEL_RUNTIME or version("rembg") != OFFICIAL_REMBG_VERSION:
+            raise ValueError("Model runtime versions differ from the official configuration")
+        if "DmlExecutionProvider" not in ort.get_available_providers():
+            raise ValueError("DirectML runtime is unavailable; no silent provider fallback")
+        options = ort.SessionOptions()
+        options.enable_mem_pattern = False
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.add_session_config_entry("ep.dml.disable_graph_fusion", "1")
+        options.intra_op_num_threads = threads
+        options.inter_op_num_threads = 1
+        session = BiRefNetSessionGeneralLite("birefnet-general-lite", options,
+            providers=[("DmlExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"])
+        session.inner_session.disable_fallback()
+        return session
     from rembg import new_session
 
     return new_session("birefnet-general-lite", providers=["CPUExecutionProvider"])
@@ -58,8 +80,19 @@ def process_image(source: Path, destination: Path, session) -> dict:
     if alpha_max == 0:
         raise ValueError("Empty foreground mask; review this image")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("xb") as stream:
-        result.save(stream, format="PNG")
+    temporary = destination.with_name("." + destination.name + "." + uuid4().hex + ".part")
+    try:
+        with temporary.open("xb") as stream:
+            result.save(stream, format="PNG")
+        # Publish only a complete PNG, and never replace an existing mask.
+        if os.name == "nt":
+            # Windows rename publishes atomically and fails if the destination exists.
+            # Hard links may be denied by restricted Windows environments.
+            os.rename(temporary, destination)
+        else:
+            os.link(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
     return {
         "source": display_path(source), "output": display_path(destination),
         "source_sha256": sha256(source_bytes).hexdigest(),
@@ -75,11 +108,17 @@ def main() -> int:
     parser.add_argument("--input", type=Path, required=True, help="Image or directory (recursive)")
     parser.add_argument("--output", type=Path, default=ROOT / "data" / "background_removed")
     parser.add_argument("--limit", type=int, help="Process only the first N images")
-    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--threads", type=int, default=2)
+    parser.add_argument("--provider", choices=["cpu", "directml"], default="directml")
     parser.add_argument("--resume", action="store_true", help="Reuse existing cutouts only after source/mask validation")
     parser.add_argument("--progress-file", type=Path, help="Write structured progress for the local application")
     parser.add_argument("--manifest", type=Path, help="Process only original images listed by the project manifest")
     args = parser.parse_args()
+    if args.provider == "directml":
+        sys.path.insert(0, str(MODEL_DIR / "runtime-directml"))
+        import onnxruntime as ort
+        if ort.__version__ != OFFICIAL_MODEL_RUNTIME or "DmlExecutionProvider" not in ort.get_available_providers():
+            parser.error("The pinned DirectML runtime is missing or does not match the official pipeline")
     if args.threads < 1 or (args.limit is not None and args.limit < 1):
         parser.error("threads and limit must be positive")
     source_root = args.input.resolve()
@@ -115,6 +154,7 @@ def main() -> int:
     session = None
     records, errors = [], []
     reused = 0
+    fatal_error = False
     for index, (source, destination) in enumerate(jobs, start=1):
         try:
             if destination.exists():
@@ -126,14 +166,19 @@ def main() -> int:
                 reused += 1
             else:
                 if session is None:
-                    session = create_session(args.threads)
-                records.append(process_image(source, destination, session))
+                    session = create_session(args.threads, args.provider)
+                record = process_image(source, destination, session)
                 validate_cutout(source, destination)
+                records.append(record)
             print(f"[{index}/{len(jobs)}] OK: {source.name}", flush=True)
         except Exception as exc:
             errors.append({"source": display_path(source), "output": display_path(destination),
                            "reason": f"{type(exc).__name__}: {exc}"})
             print(f"[{index}/{len(jobs)}] ERROR: {source}: {exc}", file=sys.stderr, flush=True)
+            # A failed DirectML session cannot recover by submitting every image
+            # to the same broken device. Preserve the first error and stop.
+            fatal_error = any(message in str(exc).lower() for message in (
+                "not enough memory", "out of memory", "dmlcommandrecorder", "device removed"))
         if args.progress_file:
             args.progress_file.parent.mkdir(parents=True, exist_ok=True)
             progress = {"completed": index, "total": len(jobs), "succeeded": index - len(errors),
@@ -142,13 +187,17 @@ def main() -> int:
             # Append events: Windows can refuse replacing a file while the UI reads it.
             with args.progress_file.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(progress, ensure_ascii=True) + "\n")
+        if fatal_error:
+            break
     output_root.mkdir(parents=True, exist_ok=True)
     report = {
         "model": "birefnet-general-lite", "model_sha256": MODEL_SHA256,
-        "provider": "CPUExecutionProvider", "threads": args.threads,
-        "rembg": version("rembg"), "onnxruntime": version("onnxruntime"),
+        "provider": "DmlExecutionProvider" if args.provider == "directml" else "CPUExecutionProvider", "threads": args.threads,
+        "disable_graph_fusion": args.provider == "directml",
+        "rembg": version("rembg"), "onnxruntime": __import__("onnxruntime").__version__,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "total": len(jobs), "succeeded": len(jobs) - len(errors), "failed": len(errors), "reused": reused,
+        "total": len(jobs), "succeeded": len(records), "failed": len(errors), "reused": reused,
+        "pending": len(jobs) - len(records) - len(errors), "fatal_provider_error": fatal_error,
         "images": records, "errors": errors,
     }
     report_path = output_root / ("processing-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + ".json")

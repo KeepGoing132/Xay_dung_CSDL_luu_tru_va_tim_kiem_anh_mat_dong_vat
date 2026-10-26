@@ -16,7 +16,7 @@ from backend.src.search_service import SearchService
 
 
 def default_query(config: AppConfig) -> Path:
-    manifest = config.default_manifest_path
+    manifest = config.source_manifest_path
     with manifest.open("r", encoding="utf-8-sig", newline="") as stream:
         row = next(row for row in csv.DictReader(stream) if row["split"] == "test")
     return config.resolve_data_path(row["relative_path"])
@@ -45,7 +45,6 @@ def make_sheet(config: AppConfig, query: Path, response, output: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Chạy một truy vấn thật và xuất bằng chứng top 5")
     parser.add_argument("--query", type=Path)
-    parser.add_argument("--weights", nargs=3, type=float, metavar=("HSV", "HOG", "LBP"), default=None)
     parser.add_argument("--profile", choices=list(PROFILE_SETTINGS))
     parser.add_argument("--weights-json", type=Path, help="JSON mapping or selected_weights.json")
     args = parser.parse_args()
@@ -53,7 +52,7 @@ def main() -> None:
     repository = Repository(config)
     repository.create_schema()
     query = args.query or default_query(config)
-    weights = Weights(*args.weights) if args.weights else Weights.from_dict(default_weights_for(config.bundle_name))
+    weights = Weights.from_dict(default_weights_for(config.bundle_name))
     if args.weights_json:
         supplied = json.loads(args.weights_json.read_text(encoding="utf-8"))
         weights = Weights.from_dict(supplied.get("weights", supplied))
